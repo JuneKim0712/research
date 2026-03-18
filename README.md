@@ -106,3 +106,137 @@ Filing
 | `extract_business_section()` | 500 chars | 500,000 chars |
 | `extract_competition_section()` | 300 chars | 500,000 chars |
 | `extract_business_header_only()` | 20 chars | 499 chars |
+
+---
+
+## Manifest Builder — `build_manifest.py`
+
+### Purpose
+
+`build_manifest.py` scans a folder of **already-extracted** filing text files
+(e.g. `2024_10k_business/`) and produces a structured manifest in both **CSV**
+and **JSON** format, plus a lightweight **parse-issues audit file**.
+
+This script does **not** re-process raw filings, run NLP, split text into
+windows, or infer any semantic content. It works only from the filenames and
+raw character/line counts of the extracted text files.
+
+---
+
+### Usage
+
+```bash
+# Basic — output goes into the same folder as the input
+python build_manifest.py --input-dir 2024_10k_business
+
+# Specify a separate output directory
+python build_manifest.py --input-dir 2024_10k_business --output-dir ./manifests
+
+# Also scan subdirectories (recursive)
+python build_manifest.py --input-dir 2024_10k_business --recursive
+
+# Change the tiny-file threshold (default: 100 chars)
+python build_manifest.py --input-dir 2024_10k_business --tiny-threshold 200
+```
+
+No third-party dependencies — only the Python standard library.
+
+---
+
+### Expected Filename Format
+
+```
+YYYY-MM-DD__COMPANY NAME__ACCESSION_sectiontype.txt
+```
+
+| Segment | Example | Notes |
+|---|---|---|
+| Date | `2024-01-31` | Leading `YYYY-MM-DD` |
+| Company name | `COMCAST CORP` | Middle segment, between `__` delimiters |
+| Accession | `0001166691-24-000011` | `##########-##-######` |
+| Section type | `business` | Suffix after the final `_` and before `.txt` |
+
+Full example: `2024-01-31__COMCAST CORP__0001166691-24-000011_business.txt`
+
+The parser is robust to:
+- Extra underscores or spaces around segment boundaries
+- All-uppercase company names (auto title-cased for readability)
+- Mixed-case company names (preserved as-is)
+- Parenthetical suffixes like `(1)` — handled gracefully
+- Missing section-type suffix — flagged in `parse_notes`
+
+---
+
+### Parsing Logic
+
+| Field | Source | Fallback |
+|---|---|---|
+| `filing_date` | Leading `YYYY-MM-DD` in filename | — |
+| `filing_year` | Derived from `filing_date` | — |
+| `source_company_name` | Middle `__`-delimited segment | — |
+| `accession_number` | Regex `\d{10}-\d{2}-\d{6}` in filename | — |
+| `source_cik` | First 10-digit block of accession (integer form) | — |
+| `cik_raw` | Same, with leading zeros preserved | — |
+| `section_type` | Suffix after accession, before `.txt` | First 4 KB of file content |
+
+The **content fallback** for `section_type` is triggered only if the filename
+parse cannot find the field. It applies a simple regex scan over the first
+4 KB of the file — no NLP, no windowing.
+
+---
+
+### Manifest Fields
+
+#### Essential fields
+
+| Field | Type | Description |
+|---|---|---|
+| `source_company_name` | str | Company name, lightly cleaned |
+| `source_cik` | str | CIK as integer string (leading zeros stripped) |
+| `filing_year` | str | 4-digit year derived from `filing_date` |
+| `filing_date` | str | `YYYY-MM-DD` from filename |
+| `accession_number` | str | Raw SEC accession, e.g. `0001166691-24-000011` |
+| `original_filename` | str | Exact filename, unchanged |
+| `section_type` | str | Extracted section label, e.g. `business` |
+
+#### Helper fields
+
+| Field | Type | Description |
+|---|---|---|
+| `file_path` | str | Absolute path to the file |
+| `file_stem` | str | Filename without `.txt` extension |
+| `text_char_count` | int | Total characters in the file |
+| `text_line_count` | int | Total lines in the file |
+| `is_empty_or_tiny` | bool | `True` if char count < `--tiny-threshold` |
+| `parse_success` | bool | `True` if all essential fields were parsed confidently |
+| `parse_notes` | str | Human-readable notes on any parse issues or fallbacks |
+| `cik_raw` | str | CIK with leading zeros preserved (10 digits) |
+
+---
+
+### Output Files
+
+| File | Description |
+|---|---|
+| `manifest.csv` | One row per `.txt` file, all fields above |
+| `manifest.json` | Same data in JSON array format |
+| `manifest_parse_issues.txt` | Lists every file where an essential field is missing or a fallback was used |
+
+---
+
+### Console Summary
+
+After running, the script prints a short summary:
+
+```
+───────────────────────────────────────────────────────
+  MANIFEST SUMMARY  —  /path/to/2024_10k_business
+───────────────────────────────────────────────────────
+  Total .txt files found     :  1,234
+  Successfully parsed        :  1,228
+  Failed / partial parses    :      6
+  Empty or tiny files        :      2  (< 100 chars)
+  Distinct section types     :      1
+    • business                         1,228
+───────────────────────────────────────────────────────
+```
