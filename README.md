@@ -305,6 +305,23 @@ The script uses a tqdm progress bar during file scanning.
 - `Tier 2`: implicit/broad cues.
 - `Tier 1`: heading fallback windows.
 
+#### Sentences harvested per trigger
+
+ABCD uses different sentence window sizes depending on trigger type:
+
+- `strict_explicit`:
+  - default: 1 sentence (trigger only)
+  - under competition heading: 3 sentences (previous + trigger + next)
+- `contextual_explicit`:
+  - default: 3 sentences (previous + trigger + next)
+  - upgraded (under competition heading or near strict cue): up to 5 sentences
+- `implicit_or_broad`:
+  - 1 sentence (trigger only)
+- `heading_fallback_broad`:
+  - 1 sentence (single fallback sentence from heading block)
+
+Global cap: at most 5 sentences per window.
+
 #### By window_priority (ranking used in dedup preference)
 
 - Higher is stronger.
