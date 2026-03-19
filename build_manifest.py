@@ -10,9 +10,12 @@ Expected filename format:
     e.g. 2024-01-31__COMCAST CORP__0001166691-24-000011_business.txt
 
 Usage:
+    python build_manifest.py
     python build_manifest.py --input-dir 2024_10k_business
     python build_manifest.py --input-dir 2024_10k_business --output-dir ./output
-    python build_manifest.py --input-dir 2024_10k_business --tiny-threshold 200
+    python build_manifest.py --input-dir 2024_10k_business --large-threshold 200
+    python build_manifest.py --input-dir 2023_10K_business --sample-size 200 --sample-seed 42
+    python build_manifest.py --input-dir 2023_10K_business --sample-size 200 --use-all-files
 
 Outputs:
     manifest.csv
@@ -25,10 +28,16 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 import re
 import sys
 from pathlib import Path
 from typing import Optional
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -50,8 +59,11 @@ FALLBACK_SEP_RE = re.compile(r"_{2,}")
 # Collapses runs of whitespace / underscores in company name segment
 CLEANUP_RE = re.compile(r"[_]{2,}|\s{2,}")
 
-# Minimum character count to be considered non-empty/non-tiny
-DEFAULT_TINY_THRESHOLD = 300  # chars
+# Minimum character count required to flag a file as large
+DEFAULT_LARGE_THRESHOLD = 200000  # chars
+
+# Default input folders (both years together)
+DEFAULT_INPUT_DIRS = ["2023_10K_business", "2024_10K_business"]
 
 # ---------------------------------------------------------------------------
 # Filename parsing
@@ -254,11 +266,45 @@ def content_fallback(text: str, field: str) -> Optional[str]:
     return None
 
 
+def detect_section_presence(text: str) -> dict:
+    """
+    Detect whether a file contains business and/or competition section headings.
+
+    Returns a dict with:
+        has_business_section: bool
+        has_competition_section: bool
+        section_presence: one of {'both', 'business_only', 'competition_only', 'neither'}
+    """
+    has_business = bool(
+        re.search(r"(?mi)^\s*item\s*1\s*[.\-:]?\s*business\b", text)
+        or re.search(r"(?mi)^\s*(our\s+)?business\b", text)
+    )
+    has_competition = bool(
+        re.search(r"(?mi)^\s*item\s*1\s*[.\-:]?\s*(our\s+)?competition\b", text)
+        or re.search(r"(?mi)^\s*(our\s+)?competition\b", text)
+    )
+
+    if has_business and has_competition:
+        section_presence = "both"
+    elif has_business:
+        section_presence = "business_only"
+    elif has_competition:
+        section_presence = "competition_only"
+    else:
+        section_presence = "neither"
+
+    return {
+        "has_business_section": has_business,
+        "has_competition_section": has_competition,
+        "section_presence": section_presence,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Core manifest builder
 # ---------------------------------------------------------------------------
 
-def build_manifest_row(path: Path, tiny_threshold: int) -> dict:
+def build_manifest_row(path: Path, large_threshold: int) -> dict:
     """Build one manifest row for the given .txt file."""
     stem = path.stem
     filename = path.name
@@ -268,23 +314,33 @@ def build_manifest_row(path: Path, tiny_threshold: int) -> dict:
     parsed = parse_filename(stem)
 
     # ── Read content ─────────────────────────────────────────────────────────
+    section_presence_info = {
+        "has_business_section": False,
+        "has_competition_section": False,
+        "section_presence": "neither",
+    }
+
     try:
         text = read_text_robust(path)
         char_count = len(text)
         line_count = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
-        is_empty_or_tiny = char_count < tiny_threshold
+        is_large = char_count > large_threshold
+        section_presence_info = detect_section_presence(text)
     except Exception as exc:
         text = ""
         char_count = 0
         line_count = 0
-        is_empty_or_tiny = True
+        is_large = False
         parsed["parse_success"] = False
         note = f"file read error: {exc}"
         parsed["parse_notes"] = (parsed["parse_notes"] + "; " + note).lstrip("; ")
 
     # ── Content fallback for missing fields ──────────────────────────────────
     if not parsed["section_type"] and text:
-        fallback_st = content_fallback(text, "section_type")
+        if section_presence_info["has_business_section"] and section_presence_info["has_competition_section"]:
+            fallback_st = "business+competition"
+        else:
+            fallback_st = content_fallback(text, "section_type")
         if fallback_st:
             parsed["section_type"] = fallback_st
             note = f"section_type from content fallback: '{fallback_st}'"
@@ -305,7 +361,10 @@ def build_manifest_row(path: Path, tiny_threshold: int) -> dict:
         "file_stem":           stem,
         "text_char_count":     char_count,
         "text_line_count":     line_count,
-        "is_empty_or_tiny":    is_empty_or_tiny,
+        "is_large":            is_large,
+        "has_business_section": section_presence_info["has_business_section"],
+        "has_competition_section": section_presence_info["has_competition_section"],
+        "section_presence":    section_presence_info["section_presence"],
         "parse_success":       parsed["parse_success"],
         "parse_notes":         parsed["parse_notes"],
         # Extra parsed detail (bonus, non-essential)
@@ -332,7 +391,10 @@ HELPER_FIELDS = [
     "file_stem",
     "text_char_count",
     "text_line_count",
-    "is_empty_or_tiny",
+    "is_large",
+    "has_business_section",
+    "has_competition_section",
+    "section_presence",
     "parse_success",
     "parse_notes",
     "cik_raw",
@@ -382,21 +444,21 @@ def write_parse_issues(rows: list[dict], out_path: Path) -> None:
 # Summary printer
 # ---------------------------------------------------------------------------
 
-def print_summary(rows: list[dict], input_dir: Path) -> None:
+def print_summary(rows: list[dict], scan_target: str, large_threshold: int) -> None:
     total = len(rows)
     ok = sum(1 for r in rows if r["parse_success"])
     failed = total - ok
-    tiny = sum(1 for r in rows if r["is_empty_or_tiny"])
+    large = sum(1 for r in rows if r["is_large"])
     section_types = sorted({r["section_type"] for r in rows if r["section_type"]})
 
     sep = "─" * 55
     print(f"\n{sep}")
-    print(f"  MANIFEST SUMMARY  —  {input_dir}")
+    print(f"  MANIFEST SUMMARY  —  {scan_target}")
     print(sep)
     print(f"  Total .txt files found     : {total:>6,}")
     print(f"  Successfully parsed        : {ok:>6,}")
     print(f"  Failed / partial parses    : {failed:>6,}")
-    print(f"  Empty or tiny files        : {tiny:>6,}  (< {DEFAULT_TINY_THRESHOLD} chars)")
+    print(f"  Large files                : {large:>6,}  (> {large_threshold} chars)")
     print(f"  Distinct section types     : {len(section_types):>6,}")
     if section_types:
         for st in section_types:
@@ -415,9 +477,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--input-dir", "-i",
-        required=True,
-        help="Path to the folder containing extracted *_business.txt files "
-             "(e.g. 2024_10k_business/).",
+           nargs="+",
+           default=DEFAULT_INPUT_DIRS,
+           help="One or more folders containing extracted *_business.txt files. "
+               "Default: 2023_10K_business and 2024_10K_business.",
     )
     p.add_argument(
         "--output-dir", "-o",
@@ -425,11 +488,11 @@ def parse_args() -> argparse.Namespace:
         help="Directory where manifest files are written (default: same as input-dir).",
     )
     p.add_argument(
-        "--tiny-threshold",
+        "--large-threshold",
         type=int,
-        default=DEFAULT_TINY_THRESHOLD,
-        help=f"Files with fewer than this many characters are flagged as "
-             f"empty/tiny (default: {DEFAULT_TINY_THRESHOLD}).",
+        default=DEFAULT_LARGE_THRESHOLD,
+        help=f"Files with more than this many characters are flagged as "
+             f"large (default: {DEFAULT_LARGE_THRESHOLD}).",
     )
     p.add_argument(
         "--recursive", "-r",
@@ -437,52 +500,127 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Also scan subdirectories inside input-dir.",
     )
+    p.add_argument(
+        "--sample-size",
+        type=int,
+        default=None,
+        help="If provided, randomly sample this many .txt files before building the manifest.",
+    )
+    p.add_argument(
+        "--sample-seed",
+        type=int,
+        default=42,
+        help="Random seed used when --sample-size is provided (default: 42).",
+    )
+    p.add_argument(
+        "--use-all-files",
+        action="store_true",
+        default=False,
+        help="Process all files and ignore --sample-size if both are provided.",
+    )
     return p.parse_args()
+
+
+def resolve_manifest_dir_name(input_dir: Path, rows: list[dict]) -> str:
+    """Return output folder name in the form {year}_manifest when possible."""
+    years = sorted({str(r.get("filing_year")) for r in rows if r.get("filing_year")})
+    if len(years) == 1 and re.fullmatch(r"\d{4}", years[0]):
+        return f"{years[0]}_manifest"
+
+    m = re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)", input_dir.name)
+    if m:
+        return f"{m.group(1)}_manifest"
+
+    return f"{input_dir.name}_manifest"
 
 
 def main() -> None:
     args = parse_args()
 
-    input_dir = Path(args.input_dir).resolve()
-    if not input_dir.exists():
-        sys.exit(f"[ERROR] Input directory not found: {input_dir}")
-    if not input_dir.is_dir():
-        sys.exit(f"[ERROR] Not a directory: {input_dir}")
+    input_dirs = [Path(p).resolve() for p in args.input_dir]
+    for input_dir in input_dirs:
+        if not input_dir.exists():
+            sys.exit(f"[ERROR] Input directory not found: {input_dir}")
+        if not input_dir.is_dir():
+            sys.exit(f"[ERROR] Not a directory: {input_dir}")
 
-    output_dir = Path(args.output_dir).resolve() if args.output_dir else input_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_base = Path(args.output_dir).resolve() if args.output_dir else None
+    if output_base:
+        output_base.mkdir(parents=True, exist_ok=True)
 
-    # ── Collect .txt files ──────────────────────────────────────────────────
-    glob_fn = input_dir.rglob if args.recursive else input_dir.glob
-    txt_files = sorted(glob_fn("*.txt"))
+    if args.use_all_files and args.sample_size is not None:
+        print("[build_manifest] --use-all-files set; ignoring --sample-size.")
+    if args.sample_size is not None and args.sample_size <= 0:
+        sys.exit("[ERROR] --sample-size must be a positive integer.")
 
-    if not txt_files:
-        sys.exit(f"[ERROR] No .txt files found in: {input_dir}")
+    processed_any = False
 
-    print(f"[build_manifest] Scanning {len(txt_files):,} .txt files in: {input_dir}")
+    for input_dir in input_dirs:
+        # ── Collect .txt files for this input directory only ───────────────
+        glob_fn = input_dir.rglob if args.recursive else input_dir.glob
+        txt_files = sorted(set(glob_fn("*.txt")))
 
-    # ── Build rows ──────────────────────────────────────────────────────────
-    rows: list[dict] = []
-    for path in txt_files:
-        row = build_manifest_row(path, tiny_threshold=args.tiny_threshold)
-        rows.append(row)
+        if not txt_files:
+            print(f"[build_manifest] No .txt files found in: {input_dir} (skipping)")
+            continue
 
-    # ── Write outputs ───────────────────────────────────────────────────────
-    csv_path   = output_dir / "manifest.csv"
-    json_path  = output_dir / "manifest.json"
-    audit_path = output_dir / "manifest_parse_issues.txt"
+        processed_any = True
+        total_files_found = len(txt_files)
 
-    write_csv(rows, csv_path)
-    write_json(rows, json_path)
-    write_parse_issues(rows, audit_path)
+        if args.sample_size is not None and not args.use_all_files:
+            sample_n = min(args.sample_size, total_files_found)
+            rng = random.Random(args.sample_seed)
+            txt_files = rng.sample(txt_files, k=sample_n)
+            print(
+                f"[build_manifest] Random sampling enabled for {input_dir.name}: "
+                f"{sample_n:,}/{total_files_found:,} files (seed={args.sample_seed})"
+            )
 
-    # ── Summary ─────────────────────────────────────────────────────────────
-    print_summary(rows, input_dir)
-    print(f"\n  Outputs written to: {output_dir}")
-    print(f"    • manifest.csv")
-    print(f"    • manifest.json")
-    print(f"    • manifest_parse_issues.txt")
-    print()
+        print(f"[build_manifest] Scanning {len(txt_files):,} .txt files in: {input_dir}")
+
+        # ── Build rows ──────────────────────────────────────────────────────
+        rows: list[dict] = []
+        row_iter = (
+            tqdm(
+                txt_files,
+                desc=f"[build_manifest] Building rows ({input_dir.name})",
+                unit="file",
+            )
+            if tqdm is not None
+            else txt_files
+        )
+        for path in row_iter:
+            row = build_manifest_row(path, large_threshold=args.large_threshold)
+            rows.append(row)
+
+        # ── Choose output dir per input/year folder ────────────────────────
+        manifest_dir_name = resolve_manifest_dir_name(input_dir, rows)
+        if output_base:
+            output_dir = output_base / manifest_dir_name
+        else:
+            output_dir = input_dir.parent / manifest_dir_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── Write outputs ───────────────────────────────────────────────────
+        csv_path   = output_dir / "manifest.csv"
+        json_path  = output_dir / "manifest.json"
+        audit_path = output_dir / "manifest_parse_issues.txt"
+
+        write_csv(rows, csv_path)
+        write_json(rows, json_path)
+        write_parse_issues(rows, audit_path)
+
+        # ── Summary ─────────────────────────────────────────────────────────
+        print_summary(rows, str(input_dir), args.large_threshold)
+        print(f"\n  Outputs written to: {output_dir}")
+        print(f"    • manifest.csv")
+        print(f"    • manifest.json")
+        print(f"    • manifest_parse_issues.txt")
+        print()
+
+    if not processed_any:
+        inputs_joined = ", ".join(str(p) for p in input_dirs)
+        sys.exit(f"[ERROR] No .txt files found in: {inputs_joined}")
 
 
 if __name__ == "__main__":

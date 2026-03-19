@@ -126,17 +126,24 @@ raw character/line counts of the extracted text files.
 ### Usage
 
 ```bash
-# Basic — output goes into the same folder as the input
-python build_manifest.py --input-dir 2024_10k_business
+# Basic — process default inputs (2023 + 2024)
+python build_manifest.py
 
-# Specify a separate output directory
-python build_manifest.py --input-dir 2024_10k_business --output-dir ./manifests
+# Single input folder
+python build_manifest.py --input-dir 2024_10K_business
+
+# Specify a separate output base directory
+# (script creates year folders like 2024_manifest under this base)
+python build_manifest.py --input-dir 2024_10K_business --output-dir ./manifests
 
 # Also scan subdirectories (recursive)
-python build_manifest.py --input-dir 2024_10k_business --recursive
+python build_manifest.py --input-dir 2024_10K_business --recursive
 
-# Change the tiny-file threshold (default: 100 chars)
-python build_manifest.py --input-dir 2024_10k_business --tiny-threshold 200
+# Change the large-file threshold (default: 200000 chars)
+python build_manifest.py --input-dir 2024_10K_business --large-threshold 250000
+
+# Optional random sampling
+python build_manifest.py --input-dir 2023_10K_business --sample-size 200 --sample-seed 42
 ```
 
 No third-party dependencies — only the Python standard library.
@@ -207,7 +214,10 @@ parse cannot find the field. It applies a simple regex scan over the first
 | `file_stem` | str | Filename without `.txt` extension |
 | `text_char_count` | int | Total characters in the file |
 | `text_line_count` | int | Total lines in the file |
-| `is_empty_or_tiny` | bool | `True` if char count < `--tiny-threshold` |
+| `is_large` | bool | `True` if char count > `--large-threshold` |
+| `has_business_section` | bool | Content heuristic detected business section heading/text |
+| `has_competition_section` | bool | Content heuristic detected competition section heading/text |
+| `section_presence` | str | One of `both`, `business_only`, `competition_only`, `neither` |
 | `parse_success` | bool | `True` if all essential fields were parsed confidently |
 | `parse_notes` | str | Human-readable notes on any parse issues or fallbacks |
 | `cik_raw` | str | CIK with leading zeros preserved (10 digits) |
@@ -230,13 +240,126 @@ After running, the script prints a short summary:
 
 ```
 ───────────────────────────────────────────────────────
-  MANIFEST SUMMARY  —  /path/to/2024_10k_business
+  MANIFEST SUMMARY  —  /path/to/2024_10K_business
 ───────────────────────────────────────────────────────
   Total .txt files found     :  1,234
   Successfully parsed        :  1,228
   Failed / partial parses    :      6
-  Empty or tiny files        :      2  (< 100 chars)
+  Large files                :      2  (> 200000 chars)
   Distinct section types     :      1
     • business                         1,228
 ───────────────────────────────────────────────────────
 ```
+
+When scanning multiple input folders, output is written into year-specific
+manifest folders, for example `2023_manifest/` and `2024_manifest/`.
+
+---
+
+## ABCD Candidate Windows + Audit Summary — `abcd.py`
+
+### What this step does
+
+`abcd.py` reads a manifest and the corresponding extracted text files, then
+builds candidate text windows around competition-related cue phrases.
+
+It writes three bucketed outputs:
+- `candidate_windows_strict_explicit.*`
+- `candidate_windows_contextual_explicit.*`
+- `candidate_windows_broad_or_implicit.*`
+
+and one audit report:
+- `window_audit_summary.txt`
+
+The script uses a tqdm progress bar during file scanning.
+
+---
+
+### How to read `window_audit_summary.txt`
+
+#### File counts
+
+- `Files in manifest (processed)`: total rows loaded from manifest.
+- `Files with resolved text path`: rows that resolved to a valid input text path.
+- `Files with at least one window`: files that produced one or more candidate windows.
+- `Files with zero windows`: files that produced none.
+
+#### Window counts
+
+- `before dedup`: raw windows before overlap deduplication.
+- `after dedup`: windows remaining after overlap-aware dedup.
+- `Heading fallback windows`: windows created by heading fallback logic.
+- `Files rescued by fallback`: files that had no cue windows but got at least one fallback window.
+
+#### By cue_group
+
+- `strict_explicit`: strongest direct competitor language.
+- `contextual_explicit`: competitive context language, may be upgraded by heading/nearby strict cues.
+- `implicit_or_broad`: broader/indirect competitive signals.
+- `heading_fallback_broad`: fallback windows from competition-like headings when no cue windows exist.
+
+#### By cue_tier (importance level)
+
+- `Tier 4`: strict explicit cues.
+- `Tier 3`: contextual explicit cues.
+- `Tier 2`: implicit/broad cues.
+- `Tier 1`: heading fallback windows.
+
+#### By window_priority (ranking used in dedup preference)
+
+- Higher is stronger.
+- Typical mapping:
+  - `5`: strict cue under competition heading (bonus)
+  - `4`: strict cue
+  - `3`: upgraded contextual cue
+  - `2`: baseline contextual cue
+  - `1`: implicit/broad cue
+  - `0`: heading fallback cue
+
+#### By section_type
+
+Derived from content analysis per source file:
+- `both`: business and competition sections detected.
+- `business_only`: business detected, competition not detected.
+- `competition_only`: competition detected, business not detected.
+- `neither`: neither detected.
+
+#### Top cue phrases
+
+Most frequent matched cue text values among retained windows.
+
+#### Top demotion reasons
+
+Common contexts that suppress or downgrade weak/non-target cues.
+
+---
+
+### Fallback and related fields (definitions)
+
+Fields appear in candidate window outputs:
+
+- `is_heading_fallback`:
+  - `true` if the window was created by heading fallback instead of a cue phrase.
+- `fallback_reason`:
+  - currently `competition_heading_without_explicit_cue` for fallback windows.
+- `demotion_reason`:
+  - reason a contextual signal was demoted/suppressed (for example generic or non-competitor context).
+
+Fallback behavior:
+- If a competition-like heading block has no regular cue windows, ABCD may create one very low-priority fallback window from that block.
+- This preserves potentially useful competitive context without over-prioritizing it.
+
+---
+
+### Window output fields (quick definitions)
+
+- `window_id`: stable window identifier.
+- `cue_text`: exact matched phrase snippet.
+- `cue_group`: strict/contextual/implicit/fallback grouping.
+- `cue_tier`: 1-4 strength tier.
+- `window_priority`: dedup ranking score.
+- `trigger_sentence`: sentence that fired the cue/fallback.
+- `window_text`: exported sentence window text.
+- `local_heading_category`: nearest heading category.
+- `export_bucket`: output bucket (`strict_explicit`, `contextual_explicit`, `broad_or_implicit`).
+- `future_profile_hint`: heuristic profile hint for downstream enrichment.
