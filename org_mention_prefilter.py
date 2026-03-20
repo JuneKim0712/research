@@ -37,6 +37,17 @@ _QUOTE_STRIP: Final[re.Pattern[str]] = re.compile(
     r'^[\s\"\'\u201c\u201d\u2018\u2019]+|[\s\"\'\u201c\u201d\u2018\u2019]+$'
 )
 
+# Strip list markers copied from slides/tables (e.g. ``• Application ; API ; …``).
+_BULLET_CHARS: Final[str] = (
+    "*"
+    "\u2022\u2023\u2043\u2219\u25E6\u25AA\u25AB"  # bullets / small squares
+    "\u00B7\u2024\u2218"  # middle dot, one-dot leader, ring operator
+    "\u2013\u2014"  # en/em dash used as faux bullets
+)
+_BULLET_STRIP: Final[re.Pattern[str]] = re.compile(
+    rf"^[{re.escape(_BULLET_CHARS)}\s]+|[{re.escape(_BULLET_CHARS)}\s]+$"
+)
+
 # Map curly/smart quotes and rare apostrophe code points to ASCII for stable matching.
 _QUOTE_NORMALIZE: Final[dict[int, str]] = {
     0x2018: "'",
@@ -86,10 +97,12 @@ _DOT_TLD: Final[re.Pattern[str]] = re.compile(
 
 
 def normalize_mention(text: str) -> str:
-    """NFKC + normalize quotes/apostrophes to ASCII + trim + collapse whitespace; strip outer quotes."""
+    """NFKC + normalize quotes/apostrophes to ASCII + trim + collapse whitespace; strip outer quotes and list bullets."""
     s = unicodedata.normalize("NFKC", text or "")
     s = "".join(_QUOTE_NORMALIZE.get(ord(c), c) for c in s)
     s = _QUOTE_STRIP.sub("", s)
+    s = " ".join(s.split())
+    s = _BULLET_STRIP.sub("", s).strip()
     s = " ".join(s.split())
     return s.strip()
 

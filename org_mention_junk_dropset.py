@@ -23,13 +23,15 @@ This module is data-only (no I/O). Edit lists here or extend via
 ``org_mention_prefilter.MentionFilter(extra_whitelist=..., extra_drop_exact=...)``.
 
 Version bump when you change rules in a material way.
+
+Standalone numbers use a dedicated regex (signs, grouping, times, ratios, ``%``, scientific ``e``, light ``*``/``_`` wrappers); see ``pure_numeric`` in ``DROP_REGEX``.
 """
 from __future__ import annotations
 
 import re
 from typing import Final
 
-DROPSPEC_VERSION: Final[str] = "4.0.0"
+DROPSPEC_VERSION: Final[str] = "4.1.1"
 DROPSPEC_EVIDENCE: Final[str] = (
     "org_detection_mentions_2000_raw.csv + org_detection_mentions_2000_nonraw.csv "
     "(RoBERTa NER, 2000 windows); inherits ORG_Strict_Raw_600* curation"
@@ -114,6 +116,8 @@ EXACT_DROP_CASEFOLD: Final[frozenset[str]] = frozenset(
         "global technology",
         "research and development",
         "human capital",
+        "401k",
+        "401(k)",
         "use authorization",
         "pneumatic comfort technologies",
         "acoustics",
@@ -225,11 +229,6 @@ EXACT_DROP_CASEFOLD: Final[frozenset[str]] = frozenset(
         "cov",
         "ec",
         "meni",
-        # Standalone numeric / ticker fragments mis-tagged
-        "1",
-        "2",
-        "4",
-        "101",
         # NER split / corruption fragments seen in org_diff + raw aggregates
         "ccenture",
         "ffymetrix, inc",
@@ -272,8 +271,20 @@ EXACT_DROP_CASEFOLD: Final[frozenset[str]] = frozenset(
 DROP_REGEX: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
     # Lone punctuation / symbols (e.g. "." ×460 in RoBERTa 2000 raw); not words/digits.
     (re.compile(r"^\W+$", re.UNICODE), "punctuation_only"),
-    # Pure numbers / numeric codes
-    (re.compile(r"^[\d][\d\s,\.]*$"), "pure_numeric"),
+    # Standalone numbers: sign; ``(…)``; ``, . : / % _`` grouping; optional ``1e6``; stray ``*``/``_`` wrappers.
+    # Does not match tokens with letters (e.g. ``3M``) except scientific ``e`` / ``E``.
+    (
+        re.compile(
+            r"^(?:[\*_]*)?"
+            r"(?:"
+            r"\(\s*[+\-\u2212]?\d[\d\s,\.\:/%_]*(?:[eE][+\-]?\d+)?\s*\)"
+            r"|"
+            r"[+\-\u2212]?\d[\d\s,\.\:/%_]*(?:[eE][+\-]?\d+)?"
+            r")"
+            r"[\*_]*$"
+        ),
+        "pure_numeric",
+    ),
     (re.compile(r"^phase\s*\d+[a-z]?\b", re.I), "clinical_phase_prefix"),
     (re.compile(r"^phase\s+[ivx]+\b", re.I), "clinical_phase_roman"),
     (re.compile(r".*\bdose\s+escalation\b", re.I), "clinical_dose_escalation"),
@@ -315,3 +326,15 @@ REVIEW_EXACT_CASEFOLD: Final[frozenset[str]] = frozenset(
 
 # 2–3 character all-caps-ish tokens default to review (conservative).
 REVIEW_SHORT_MAX_LEN: Final[int] = 3
+
+
+if __name__ == "__main__":
+    import json
+    from pathlib import Path
+
+    from org_mention_prefilter import export_dropset_snapshot
+
+    out = Path(__file__).resolve().with_name("org_mention_junk_dropset.json")
+    snap = export_dropset_snapshot()
+    out.write_text(json.dumps(snap, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"Wrote {out} (version {snap['version']})")

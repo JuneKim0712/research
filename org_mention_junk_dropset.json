@@ -1,5 +1,5 @@
 {
-  "version": "4.0.0",
+  "version": "4.1.1",
   "evidence": "org_detection_mentions_2000_raw.csv + org_detection_mentions_2000_nonraw.csv (RoBERTa NER, 2000 windows); inherits ORG_Strict_Raw_600* curation",
   "whitelist_exact_casefold": [
     "abi",
@@ -7,11 +7,9 @@
     "x"
   ],
   "exact_drop_casefold": [
-    "1",
-    "101",
     "1940 act",
-    "2",
-    "4",
+    "401(k)",
+    "401k",
     "acoustics",
     "african",
     "ag",
@@ -229,7 +227,7 @@
       "punctuation_only"
     ],
     [
-      "^[\\d][\\d\\s,\\.]*$",
+      "^(?:[\\*_]*)?(?:\\(\\s*[+\\-\\u2212]?\\d[\\d\\s,\\.\\:/%_]*(?:[eE][+\\-]?\\d+)?\\s*\\)|[+\\-\\u2212]?\\d[\\d\\s,\\.\\:/%_]*(?:[eE][+\\-]?\\d+)?)[\\*_]*$",
       "pure_numeric"
     ],
     [
