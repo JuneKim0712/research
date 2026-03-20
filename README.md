@@ -380,3 +380,121 @@ Fallback behavior:
 - `local_heading_category`: nearest heading category.
 - `export_bucket`: output bucket (`strict_explicit`, `contextual_explicit`, `broad_or_implicit`).
 - `future_profile_hint`: heuristic profile hint for downstream enrichment.
+
+---
+
+## ORG Detection (sometimes written as ORF) - `abcdef.py`
+
+### Purpose
+
+`abcdef.py` performs organization-mention extraction on explicit candidate
+windows and writes two aligned outputs:
+
+1. A **Raw** file (one row per input window) with all mention-level detections
+  preserved in ordered, semicolon-joined columns.
+2. A **NonRaw** file (one row per input window) with deduplicated ORG mentions
+  per window.
+
+Both outputs share the same window-level metadata so they can be compared
+side-by-side by `window_id`.
+
+---
+
+### Model Stack
+
+For each window, the script runs two NER extractors and merges their spans:
+
+1. **spaCy** (`en_core_web_sm` by default): keeps `ORG` entities.
+2. **Hugging Face** (`dslim/bert-base-NER`): keeps `ORG` and `MISC` entity groups.
+
+The script normalizes text (whitespace + zero-width cleanup), detects entities on
+normalized text, then maps entity offsets back to original `window_text`
+character positions.
+
+---
+
+### Input
+
+Expected input is a candidate-window CSV containing at least:
+
+- `window_id`
+- `window_text`
+
+And usually additional metadata such as:
+
+- `source_company`, `source_cik`, `filing_year`
+- `section`, `cue_phrase`, `cue_group`, `trigger_sentence`
+
+---
+
+### Usage
+
+```bash
+python abcdef.py -i <input_windows.csv> -o <raw_output.csv>
+```
+
+Optional flags:
+
+- `--spacy-model` (default `en_core_web_sm`)
+- `--device` (`-1` for CPU, `0+` for GPU index)
+- `--preview` number of rows to print
+
+Dependency notes:
+
+- Requires `spacy`, `transformers`, and model files.
+- Requires spaCy English model download (example: `python -m spacy download en_core_web_sm`).
+
+---
+
+### Output Files
+
+Given `-o my_raw.csv`, the script writes:
+
+1. `my_raw.csv` (Raw)
+2. `my_raw_nonraw.csv` (NonRaw)
+
+Both outputs are one row per input window.
+
+---
+
+### Raw Output Schema (one row per window)
+
+Core metadata columns:
+
+- `window_id`, `source_company`, `source_cik`, `filing_year`
+- `section`, `cue_phrase`, `cue_group`, `trigger_sentence`, `window_text`
+
+Raw ORG columns:
+
+- `org_mention_count`: number of extracted mention spans in that window
+- `org_mentions_raw`: mention texts in extraction order (semicolon-separated)
+- `mention_starts_raw`: start offsets aligned to `org_mentions_raw`
+- `mention_ends_raw`: end offsets aligned to `org_mentions_raw`
+- `extractors_raw`: extractor labels aligned to `org_mentions_raw`
+
+This output preserves mention-level detail while keeping all values in the same
+window row.
+
+---
+
+### NonRaw Output Schema (one row per window)
+
+Core metadata columns match Raw.
+
+NonRaw ORG columns:
+
+- `org_mention_count`: number of unique ORG mention texts in window
+- `org_mentions`: unique mention texts (case-insensitive dedupe, semicolon-separated)
+
+This output is intended for cleaner downstream comparison and reporting.
+
+---
+
+### How Raw vs NonRaw Differ
+
+1. **Raw** keeps every extracted mention span (including repeated text or
+  overlapping variants) and keeps per-mention offsets/extractor traces.
+2. **NonRaw** compresses each window to unique mention texts only.
+
+Because both are keyed by the same `window_id` and include the same metadata,
+you can compare them directly.
