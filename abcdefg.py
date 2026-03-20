@@ -26,10 +26,13 @@ Version bump when you change rules in a material way.
 """
 from __future__ import annotations
 
+import argparse
+import csv
+from collections import Counter
 import re
 from typing import Final
 
-DROPSPEC_VERSION: Final[str] = "4.0.0"
+DROPSPEC_VERSION: Final[str] = "4.0.1"
 DROPSPEC_EVIDENCE: Final[str] = (
     "org_detection_mentions_2000_raw.csv + org_detection_mentions_2000_nonraw.csv "
     "(RoBERTa NER, 2000 windows); inherits ORG_Strict_Raw_600* curation"
@@ -90,6 +93,7 @@ EXACT_DROP_CASEFOLD: Final[frozenset[str]] = frozenset(
         "internet",
         "european",
         "north american",
+        "non-north american",
         "asian",
         "latin american",
         "middle eastern",
@@ -111,6 +115,7 @@ EXACT_DROP_CASEFOLD: Final[frozenset[str]] = frozenset(
         "lng",
         "eds",
         "operations",
+        "functional",
         "global technology",
         "research and development",
         "human capital",
@@ -225,11 +230,6 @@ EXACT_DROP_CASEFOLD: Final[frozenset[str]] = frozenset(
         "cov",
         "ec",
         "meni",
-        # Standalone numeric / ticker fragments mis-tagged
-        "1",
-        "2",
-        "4",
-        "101",
         # NER split / corruption fragments seen in org_diff + raw aggregates
         "ccenture",
         "ffymetrix, inc",
@@ -315,3 +315,89 @@ REVIEW_EXACT_CASEFOLD: Final[frozenset[str]] = frozenset(
 
 # 2–3 character all-caps-ish tokens default to review (conservative).
 REVIEW_SHORT_MAX_LEN: Final[int] = 3
+
+
+def _split_mentions(raw: str, sep: str = " ; ") -> list[str]:
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(sep) if part.strip()]
+
+
+def audit_filtered_out_counts(
+    csv_path: str,
+    *,
+    union_column: str = "org_mentions_union",
+    filtered_column: str = "org_mentions_union_filtered",
+    sep: str = " ; ",
+    top_n: int = 25,
+) -> dict[str, object]:
+    union_total = 0
+    filtered_total = 0
+    filtered_out_total = 0
+
+    union_unique: set[str] = set()
+    filtered_unique: set[str] = set()
+    filtered_out_counter: Counter[str] = Counter()
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            union_mentions = _split_mentions((row.get(union_column) or "").strip(), sep=sep)
+            filtered_mentions = _split_mentions((row.get(filtered_column) or "").strip(), sep=sep)
+
+            union_total += len(union_mentions)
+            filtered_total += len(filtered_mentions)
+
+            union_unique.update(union_mentions)
+            filtered_unique.update(filtered_mentions)
+
+            removed = Counter(union_mentions) - Counter(filtered_mentions)
+            filtered_out_total += sum(removed.values())
+            filtered_out_counter.update(removed)
+
+    return {
+        "union_total": union_total,
+        "filtered_total": filtered_total,
+        "filtered_out_total": filtered_out_total,
+        "union_unique_count": len(union_unique),
+        "filtered_unique_count": len(filtered_unique),
+        "filtered_out_unique_count": len(filtered_out_counter),
+        "top_filtered_out": filtered_out_counter.most_common(top_n),
+    }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Show how many mention tokens were filtered out from union to filtered union columns."
+    )
+    parser.add_argument("csv_path", help="Path to CSV containing union + filtered union columns")
+    parser.add_argument(
+        "--union-column",
+        default="org_mentions_union",
+        help="Column with pre-filter union mentions",
+    )
+    parser.add_argument(
+        "--filtered-column",
+        default="org_mentions_union_filtered",
+        help="Column with post-filter union mentions",
+    )
+    parser.add_argument("--sep", default=" ; ", help="Mention separator used in columns")
+    parser.add_argument("--top", type=int, default=25, help="Show top-N filtered-out mentions")
+    args = parser.parse_args()
+
+    stats = audit_filtered_out_counts(
+        args.csv_path,
+        union_column=args.union_column,
+        filtered_column=args.filtered_column,
+        sep=args.sep,
+        top_n=args.top,
+    )
+
+    print(f"union_total_mentions: {stats['union_total']}")
+    print(f"filtered_total_mentions: {stats['filtered_total']}")
+    print(f"filtered_out_total_mentions: {stats['filtered_out_total']}")
+    print(f"union_unique_mentions: {stats['union_unique_count']}")
+    print(f"filtered_unique_mentions: {stats['filtered_unique_count']}")
+    print(f"filtered_out_unique_mentions: {stats['filtered_out_unique_count']}")
+    print("top_filtered_out_mentions:")
+    for mention, count in stats["top_filtered_out"]:
+        print(f"  {count:5d}  {mention}")

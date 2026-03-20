@@ -34,7 +34,7 @@ from org_mention_junk_dropset import (
 MentionLabel = Literal["keep", "drop_obvious_junk", "review"]
 
 _QUOTE_STRIP: Final[re.Pattern[str]] = re.compile(
-    r'^[\s\"\'\u201c\u201d\u2018\u2019]+|[\s\"\'\u201c\u201d\u2018\u2019]+$'
+    r'^[\s\"\'\u201c\u201d\u2018\u2019\u2022\u2023\u25e6\u2043\u2219]+|[\s\"\'\u201c\u201d\u2018\u2019\u2022\u2023\u25e6\u2043\u2219]+$'
 )
 
 # Strip list markers copied from slides/tables (e.g. ``• Application ; API ; …``).
