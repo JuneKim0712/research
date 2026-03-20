@@ -95,7 +95,7 @@ flowchart LR
 | **Overlap dedup (bigram Jaccard-style)** | Adjacent sentences can trigger duplicate windows; dedup saves annotation/NER cost. **`analyze_dedup.py`** exists to verify we do not merge distinct evidence. |
 | **Heading fallback (in `abcd.py`)** | If a competition heading exists but no cue fired, you still get a **low-priority** window so human or downstream review can recover recall. |
 | **Dual NER + span merge** | Single models miss spans or mis-tag; **union** improves recall. Offsets map through **normalized text** so spans align to **original** `window_text`. |
-| **`org_mention_junk_dropset` + `prefilter`** | NER emits **legal suffixes, geographies, fragments**. A **sample-informed** dropset (`ORG_Strict_Raw_600*`) supports automatic junk removal before alias/edge work—transparently versioned. |
+| **`org_mention_junk_dropset` + `prefilter`** | NER emits **legal suffixes, geographies, fragments**. A **sample-informed** dropset (RoBERTa `org_detection_mentions_2000_*`, plus `ORG_Strict_Raw_600*`) supports automatic junk removal before alias/edge work—transparently versioned. |
 
 ---
 
@@ -113,8 +113,8 @@ flowchart LR
 | **`build_explicit_candidate_windows.py`** / **`abcde.py`** | Filter to **strict + contextual explicit** rows; dedupe; assign **`window_id`** → **`explicit_candidate_windows.csv`**. |
 | **`abcdef.py`** | **Window-level** ORG harvest: raw columns, **`_nonraw`** dedupe, **`_org_diff`** span analysis. |
 | **`extract_explicit_mentions_raw.py`** | **One row per mention span** (no window aggregation / org-diff). |
-| **`org_mention_prefilter.py`** | Labels mentions: `keep` / `drop_obvious_junk` / `review`. |
-| **`org_mention_junk_dropset.py`** | Data-only **regex + exact-match** lists backing the prefilter; version `DROPSPEC_VERSION`. |
+| **`org_mention_prefilter.py`** | Labels each raw mention string: `keep` / `drop_obvious_junk` / `review` (see [§ Mention quality](#mention-quality-prefilter-and-dropset)). |
+| **`org_mention_junk_dropset.py`** | **Data-only** policy for the prefilter: exact sets, regexes, review list; versioned as `DROPSPEC_VERSION` / `DROPSPEC_EVIDENCE` (examples in [§ Mention quality](#mention-quality-prefilter-and-dropset)). |
 | **`count_competition_only.py`** | Heuristic **count** of extracts that look **competition-only** (no business header in snippet). |
 | **`isolate_no_outgoing_edges.py`** | **Moves** files from `2023_10K_business` into `2023_no_outgoing_edges` per audit JSON list. |
 | **`cleanup_recheck.py`**, **`update_json_paths.py`**, **`update_folder_names.py`** | Small **2023 list / path** maintenance scripts for `2023_business_no_competition_term_list.json`. |
@@ -177,13 +177,53 @@ Same models and normalization, but output is **one row per mention span** (`raw_
 
 ## Mention quality: prefilter and dropset
 
-**`org_mention_prefilter.py`** implements `MentionFilter` / `label_mention()` to mark strings before alias resolution or graph edges:
+NER tags **strings**, not resolved entities: legal suffixes, geography, punctuation-only spans, payers, and filing boilerplate often appear as `ORG`. The junk layer sits **after** span extraction and **before** alias resolution or edge construction so downstream steps do not treat obvious noise as company names.
 
-- **`keep`** — pass through.
-- **`drop_obvious_junk`** — high-confidence noise (legal forms, geography fragments, etc., from curated lists + regex in **`org_mention_junk_dropset.py`**).
-- **`review`** — ambiguous; excluded from automatic graph construction unless promoted.
+| Piece | Role |
+|--------|------|
+| **`org_mention_junk_dropset.py`** | **Data only** — `WHITELIST_EXACT_CASEFOLD`, `EXACT_DROP_CASEFOLD`, `DROP_REGEX`, `REVIEW_EXACT_CASEFOLD`. No I/O. Tuned on RoBERTa **`org_detection_mentions_2000_*`** plus earlier strict 600-window runs. |
+| **`org_mention_prefilter.py`** | **Policy** — `normalize_mention()` (quotes/apostrophes → ASCII), `merge_dot_com_spans()`, `MentionFilter.label()`, `label_mention(..., source_company=...)`. Dropset rules plus optional self-filer suppression. |
 
-The dropset documents evidence in **`DROPSPEC_EVIDENCE`** (e.g. strict explicit 600-window samples). Extend via `MentionFilter(extra_whitelist=..., extra_drop_exact=...)`.
+**Versioning.** `DROPSPEC_VERSION` bumps when rules change materially; `DROPSPEC_EVIDENCE` names the sample CSVs the policy was grounded in. `org_mention_prefilter.export_dropset_snapshot()` (and `org_mention_junk_dropset.json`) mirror the live sets for diffs.
+
+**Labels.**
+
+- **`keep`** — pass through to linking / graph code.
+- **`drop_obvious_junk`** — high-confidence non-competitor or non-firm noise (legal shells, lone punctuation, agencies, clinical phrases, etc.).
+- **`review`** — short or ambiguous tokens; do not auto-wire as edges unless you promote them (e.g. whitelist).
+
+**Policy (v4 dropset + prefilter).** Smart quotes/apostrophes normalize to ASCII. Single-letter spans drop except **`x`**. Standalone punctuation and pure-numeric strings drop. Stray **TLD** tokens (`com`, `net`, `org`) drop; use **`merge_dot_com_spans`** on `(text, start, end)` lists to rejoin `Bill.`+`com` → `Bill.com`. Generic governance words, agencies, statute `… Act` phrases, biotech/regulatory wording (e.g. inhibitor, patients, FDA approval), SPAC/IPO boilerplate, service phrases (supply chain services, …), regional descriptors, and trial-stage regexes apply as in `org_mention_junk_dropset.py`. **`source_company`** (filer name from the window row) enables **self-name suppression**: the filer is not treated as its own competitor unless you **whitelist** an unusual case.
+
+**Examples** (`label_mention` returns `(label, reason_slug)`):
+
+```python
+from org_mention_prefilter import label_mention, merge_dot_com_spans
+
+label_mention("Inc.")                       # drop_obvious_junk / exact_drop
+label_mention("Charter")                    # drop_obvious_junk / exact_drop
+label_mention("com")                        # drop_obvious_junk / exact_drop  # stray TLD fragment
+merge_dot_com_spans([("Bill.", 0, 5), ("com", 5, 8)])  # -> [('Bill.com', 0, 8)]
+
+label_mention("inhibitor")                  # drop_obvious_junk / inhibitor_word
+label_mention("FDA approval")              # drop_obvious_junk / fda_approval_phrase
+label_mention("initial public offering")   # drop_obvious_junk / exact_drop
+label_mention("supply chain services")     # drop_obvious_junk / exact_drop
+label_mention("european")                  # drop_obvious_junk / exact_drop
+
+label_mention("Pfizer")                    # keep / default_keep  # rival (no source passed)
+label_mention("Pfizer", source_company="Pfizer Inc.")   # drop / self_source_full_match
+label_mention("Acme", source_company="Acme Pharmaceuticals, Inc.")  # review / self_source_fragment_review
+
+label_mention("Charter Communications")    # keep / default_keep
+label_mention("x")                         # keep / whitelist
+label_mention("AWS")                       # keep / whitelist
+
+label_mention("car")                       # review / review_exact
+```
+
+Audit with self-suppression: `python org_mention_prefilter.py windows.csv --source-column source_company`
+
+**Extending.** Use `MentionFilter(extra_whitelist={"Medicare"}, extra_drop_exact={"obvious typo inc"})` when a study needs to **keep** or **drop** strings that conflict with the global defaults (e.g. whitelist a payer you want as a node).
 
 ---
 

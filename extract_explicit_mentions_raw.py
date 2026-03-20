@@ -16,8 +16,7 @@ Dependencies (see requirements-explicit-mentions.txt):
   python -m spacy download en_core_web_sm   # or en_core_web_md / en_core_web_lg for recall
 
 Input default:  ./explicit_candidate_windows.csv
-Output default: ./explicit_mentions_raw.csv (window-level span list), ./explicit_mentions_raw_nonraw.csv (deduped),
-  and ./explicit_mentions_raw_org_diff.csv (per-window ORG surplus vs nonraw, unless --org-diff-log is set).
+Output default: ./explicit_mentions_raw.csv
 """
 
 from __future__ import annotations
@@ -45,7 +44,6 @@ except ImportError as e:  # pragma: no cover
 else:
     _TRANSFORMERS_IMPORT_ERROR = None
 
-# Default HF model: RoBERTa-large CoNLL English (ORG / LOC / PER / MISC); not BERT.
 DEFAULT_HF_NER_MODEL = "Jean-Baptiste/roberta-large-ner-english"
 DEFAULT_HF_EXTRACTOR_TAG = "roberta_ner"
 
@@ -54,7 +52,7 @@ _ZERO_WIDTH = frozenset(
     "\u200b\u200c\u200d\u2060\u2061\u2062\u2063\ufeff\u00ad"
 )
 
-OUTPUT_FIELDS_RAW = [
+OUTPUT_FIELDS = [
     "window_id",
     "source_company",
     "source_cik",
@@ -63,39 +61,12 @@ OUTPUT_FIELDS_RAW = [
     "cue_phrase",
     "cue_group",
     "trigger_sentence",
-    "window_text",
-    "org_mention_count",
-    "org_mentions_raw",
-    "mention_starts_raw",
-    "mention_ends_raw",
-    "extractors_raw",
-]
-
-OUTPUT_FIELDS_NONRAW = [
-    "window_id",
-    "source_company",
-    "source_cik",
-    "filing_year",
-    "section",
-    "cue_phrase",
-    "cue_group",
-    "trigger_sentence",
-    "window_text",
-    "org_mention_count",
-    "org_mentions",
-]
-
-# One row per surplus ORG mention vs the nonraw (deduped-by-text) view, or per nonraw-only anomaly.
-OUTPUT_FIELDS_ORG_DIFF = [
-    "window_id",
-    "raw_org_span_count",
-    "nonraw_unique_org_count",
     "raw_mention",
     "mention_start",
     "mention_end",
     "extractor_name",
-    "extra_source",
-    "diff_reason",
+    "sentence_text",
+    "window_text",
 ]
 
 
@@ -277,206 +248,12 @@ def read_windows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
-def write_mentions(path: Path, rows: list[dict[str, Any]], fieldnames: list[str] | None = None) -> None:
+def write_mentions(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if fieldnames is None:
-        fieldnames = OUTPUT_FIELDS_RAW
     with path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
-
-
-def aggregate_mentions_by_window(
-    windows: list[dict[str, str]],
-    raw_mention_rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """
-    Aggregate raw mention rows by window to produce one row per window with
-    aggregated ORG mention list.
-
-        Returns one row per input window with added columns:
-            org_mention_count: count of unique mentions
-            org_mentions: semicolon-separated list of unique mentions
-    """
-    # Build window -> unique mentions mapping
-    mentions_by_window: dict[str, list[str]] = {}
-    seen_by_window: dict[str, set[str]] = {}
-
-    for w_dict in windows:
-        w_id = (w_dict.get("window_id") or "").strip()
-        if w_id:
-            mentions_by_window[w_id] = []
-            seen_by_window[w_id] = set()
-
-    for mention_row in raw_mention_rows:
-        w_id = (mention_row.get("window_id") or "").strip()
-        m_text = (
-            mention_row.get("org_mention_text")
-            or mention_row.get("raw_mention")
-            or ""
-        ).strip()
-        if not w_id or not m_text or w_id not in mentions_by_window:
-            continue
-        m_key = m_text.lower()
-        if m_key in seen_by_window[w_id]:
-            continue
-        seen_by_window[w_id].add(m_key)
-        mentions_by_window[w_id].append(m_text)
-
-    # Prepare output: one row per window with aggregated mentions
-    out_rows: list[dict[str, Any]] = []
-    for w_dict in windows:
-        w_id = (w_dict.get("window_id") or "").strip()
-        row_out = dict(w_dict)
-        row_out["org_mention_count"] = str(len(mentions_by_window.get(w_id, [])))
-        row_out["org_mentions"] = " ; ".join(mentions_by_window.get(w_id, []))
-        out_rows.append(row_out)
-
-    return out_rows
-
-
-def build_org_diff_log_rows(
-    windows: list[dict[str, str]],
-    mention_rows: list[dict[str, Any]],
-    nonraw_by_window_id: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """
-    Compare span-level ORG harvest (all rows in mention_rows per window) to the nonraw rule
-    (first occurrence per case-insensitive mention string).
-
-    - Surplus spans (2nd+ occurrence of the same text) are logged with extra_source=raw and
-      diff_reason=duplicate_in_raw.
-    - If the aggregated nonraw string list ever contains a text not seen in any span row
-      (should not happen with a consistent pipeline), log one row per such text with
-      extra_source=nonraw and diff_reason=only_in_nonraw_aggregate.
-
-    Windows with no differences produce no rows.
-    """
-    by_wid: dict[str, list[dict[str, Any]]] = {}
-    for r in mention_rows:
-        wid = (r.get("window_id") or "").strip()
-        if not wid:
-            continue
-        by_wid.setdefault(wid, []).append(r)
-
-    out: list[dict[str, Any]] = []
-    for w_dict in windows:
-        wid = (w_dict.get("window_id") or "").strip()
-        mrows = by_wid.get(wid, [])
-        raw_total = len(mrows)
-        if raw_total == 0:
-            continue
-
-        mrows_sorted = sorted(
-            mrows,
-            key=lambda x: (
-                int(x.get("mention_start") or 0),
-                int(x.get("mention_end") or 0),
-                str(x.get("org_mention_text") or ""),
-            ),
-        )
-
-        span_texts_lower: set[str] = set()
-        for r in mrows_sorted:
-            text = str(r.get("org_mention_text") or r.get("raw_mention") or "").strip()
-            if text:
-                span_texts_lower.add(text.lower())
-
-        uniq_after = len(span_texts_lower)
-
-        seen_lower: set[str] = set()
-        for r in mrows_sorted:
-            text = str(r.get("org_mention_text") or r.get("raw_mention") or "").strip()
-            low = text.lower()
-            if not low:
-                continue
-            if low in seen_lower:
-                out.append({
-                    "window_id": wid,
-                    "raw_org_span_count": raw_total,
-                    "nonraw_unique_org_count": uniq_after,
-                    "raw_mention": text,
-                    "mention_start": r.get("mention_start", ""),
-                    "mention_end": r.get("mention_end", ""),
-                    "extractor_name": r.get("extractor_name", ""),
-                    "extra_source": "raw",
-                    "diff_reason": "duplicate_in_raw",
-                })
-            else:
-                seen_lower.add(low)
-
-        # Defensive: strings appearing in *_nonraw aggregate but not in any span row
-        nonraw_row = nonraw_by_window_id.get(wid)
-        if nonraw_row:
-            agg_parts = [
-                p.strip()
-                for p in str(nonraw_row.get("org_mentions") or "").split(" ; ")
-                if p.strip()
-            ]
-            for phrase in agg_parts:
-                low = phrase.lower()
-                if low and low not in span_texts_lower:
-                    out.append({
-                        "window_id": wid,
-                        "raw_org_span_count": raw_total,
-                        "nonraw_unique_org_count": uniq_after,
-                        "raw_mention": phrase,
-                        "mention_start": "",
-                        "mention_end": "",
-                        "extractor_name": "",
-                        "extra_source": "nonraw",
-                        "diff_reason": "only_in_nonraw_aggregate",
-                    })
-
-    return out
-
-
-def aggregate_raw_mentions_by_window(
-    windows: list[dict[str, str]],
-    raw_mention_rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """One-row-per-window raw output (no dedupe): preserve mention sequence and details."""
-    mentions_by_window: dict[str, list[dict[str, str]]] = {}
-    for w_dict in windows:
-        w_id = (w_dict.get("window_id") or "").strip()
-        if w_id:
-            mentions_by_window[w_id] = []
-
-    for mention_row in raw_mention_rows:
-        w_id = (mention_row.get("window_id") or "").strip()
-        if not w_id or w_id not in mentions_by_window:
-            continue
-        mentions_by_window[w_id].append({
-            "text": str(mention_row.get("org_mention_text") or mention_row.get("raw_mention") or "").strip(),
-            "start": str(mention_row.get("mention_start") or ""),
-            "end": str(mention_row.get("mention_end") or ""),
-            "extractor": str(mention_row.get("extractor_name") or ""),
-        })
-
-    out_rows: list[dict[str, Any]] = []
-    for w_dict in windows:
-        w_id = (w_dict.get("window_id") or "").strip()
-        items = mentions_by_window.get(w_id, [])
-        row_out = {
-            "window_id": w_dict.get("window_id", ""),
-            "source_company": w_dict.get("source_company", ""),
-            "source_cik": w_dict.get("source_cik", ""),
-            "filing_year": w_dict.get("filing_year", ""),
-            "section": w_dict.get("section", ""),
-            "cue_phrase": w_dict.get("cue_phrase", ""),
-            "cue_group": w_dict.get("cue_group", ""),
-            "trigger_sentence": w_dict.get("trigger_sentence", ""),
-            "window_text": w_dict.get("window_text", ""),
-            "org_mention_count": str(len(items)),
-            "org_mentions_raw": " ; ".join(i["text"] for i in items if i["text"]),
-            "mention_starts_raw": " ; ".join(i["start"] for i in items if i["start"]),
-            "mention_ends_raw": " ; ".join(i["end"] for i in items if i["end"]),
-            "extractors_raw": " ; ".join(i["extractor"] for i in items if i["extractor"]),
-        }
-        out_rows.append(row_out)
-
-    return out_rows
 
 
 def print_preview(title: str, path: Path, n: int = 5) -> None:
@@ -547,12 +324,12 @@ def process_windows(
                 "cue_phrase": wrow.get("cue_phrase", ""),
                 "cue_group": wrow.get("cue_group", ""),
                 "trigger_sentence": wrow.get("trigger_sentence", ""),
-                "window_text": window_orig,
-                "org_mention_text": raw_mention,
+                "raw_mention": raw_mention,
                 "mention_start": o0,
                 "mention_end": o1,
-                "sentence_text": sentence_text,
                 "extractor_name": "+".join(sorted(ex_names)),
+                "sentence_text": sentence_text,
+                "window_text": window_orig,
             })
 
     rows.sort(key=lambda r: (r["window_id"], r["mention_start"], r["mention_end"], r["extractor_name"]))
@@ -601,12 +378,6 @@ def main() -> int:
         default=5,
         help="Print this many sample rows from input and output CSV (0 to skip)",
     )
-    parser.add_argument(
-        "--org-diff-log",
-        type=Path,
-        default=None,
-        help="CSV for ORG mention differences (raw vs nonraw). Default: <output stem>_org_diff.csv beside -o",
-    )
     args = parser.parse_args()
 
     inp = args.input.resolve()
@@ -627,34 +398,13 @@ def main() -> int:
 
     windows = read_windows(inp)
     print(f"Processing {len(windows)} windows from {inp}")
-    mention_rows = process_windows(
-        windows, nlp, ner_pipe, hf_extractor_tag=args.hf_extractor_tag
-    )
-    raw_rows = aggregate_raw_mentions_by_window(windows, mention_rows)
-    write_mentions(outp, raw_rows, fieldnames=OUTPUT_FIELDS_RAW)
-    print(f"Wrote {len(raw_rows)} raw window rows to {outp}")
-
-    # Generate nonraw window-level output with aggregated mentions
-    nonraw_outp = outp.parent / (outp.stem + "_nonraw" + outp.suffix)
-    nonraw_rows = aggregate_mentions_by_window(windows, mention_rows)
-    write_mentions(nonraw_outp, nonraw_rows, fieldnames=OUTPUT_FIELDS_NONRAW)
-    print(f"Wrote {len(nonraw_rows)} window rows to {nonraw_outp}")
-
-    nonraw_by_id = {(r.get("window_id") or "").strip(): r for r in nonraw_rows}
-    diff_path = (
-        args.org_diff_log.resolve()
-        if args.org_diff_log is not None
-        else (outp.parent / (outp.stem + "_org_diff" + outp.suffix))
-    )
-    diff_rows = build_org_diff_log_rows(windows, mention_rows, nonraw_by_id)
-    write_mentions(diff_path, diff_rows, fieldnames=OUTPUT_FIELDS_ORG_DIFF)
-    print(f"Wrote {len(diff_rows)} org-diff rows to {diff_path}")
+    rows = process_windows(windows, nlp, ner_pipe, hf_extractor_tag=args.hf_extractor_tag)
+    write_mentions(outp, rows)
+    print(f"Wrote {len(rows)} mention rows to {outp}")
 
     if args.preview > 0:
         print_preview("INPUT", inp, args.preview)
-        print_preview("OUTPUT (raw)", outp, args.preview)
-        print_preview("OUTPUT (nonraw)", nonraw_outp, args.preview)
-        print_preview("OUTPUT (org diff)", diff_path, args.preview)
+        print_preview("OUTPUT", outp, args.preview)
 
     return 0
 

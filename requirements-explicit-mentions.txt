@@ -1,0 +1,4 @@
+# Raw explicit mention harvesting (spaCy + transformers NER). CPU-friendly defaults.
+spacy>=3.7.0,<4
+transformers>=4.36.0
+torch>=2.0.0
