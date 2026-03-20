@@ -34,7 +34,7 @@ from typing import Final
 
 DROPSPEC_VERSION: Final[str] = "4.0.1"
 DROPSPEC_EVIDENCE: Final[str] = (
-    "org_detection_mentions_2000_raw.csv + org_detection_mentions_2000_nonraw.csv "
+    "raw.csv + nonraw.csv "
     "(RoBERTa NER, 2000 windows); inherits ORG_Strict_Raw_600* curation"
 )
 
@@ -323,6 +323,19 @@ def _split_mentions(raw: str, sep: str = " ; ") -> list[str]:
     return [part.strip() for part in raw.split(sep) if part.strip()]
 
 
+def _resolve_present_column(
+    fieldnames: list[str],
+    primary: str,
+    fallbacks: tuple[str, ...],
+) -> str:
+    if primary in fieldnames:
+        return primary
+    for col in fallbacks:
+        if col in fieldnames:
+            return col
+    raise ValueError(f"Missing required column {primary!r}; found columns: {fieldnames}")
+
+
 def audit_filtered_out_counts(
     csv_path: str,
     *,
@@ -340,9 +353,22 @@ def audit_filtered_out_counts(
     filtered_out_counter: Counter[str] = Counter()
 
     with open(csv_path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            union_mentions = _split_mentions((row.get(union_column) or "").strip(), sep=sep)
-            filtered_mentions = _split_mentions((row.get(filtered_column) or "").strip(), sep=sep)
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        resolved_union_col = _resolve_present_column(
+            fieldnames,
+            union_column,
+            ("org_mentions_union_raw",),
+        )
+        resolved_filtered_col = _resolve_present_column(
+            fieldnames,
+            filtered_column,
+            tuple(),
+        )
+
+        for row in reader:
+            union_mentions = _split_mentions((row.get(resolved_union_col) or "").strip(), sep=sep)
+            filtered_mentions = _split_mentions((row.get(resolved_filtered_col) or "").strip(), sep=sep)
 
             union_total += len(union_mentions)
             filtered_total += len(filtered_mentions)

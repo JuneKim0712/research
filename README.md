@@ -19,8 +19,9 @@ The work sits at the intersection of **information extraction** and **corporate 
 9. [Stage 5: Organization mentions (NER)](#stage-5-organization-mentions-ner)
 10. [Mention quality: prefilter and dropset](#mention-quality-prefilter-and-dropset)
 11. [Dependencies](#dependencies)
-12. [Open challenges and limitations](#open-challenges-and-limitations)
-13. [Reference: folders, routing, audits, thresholds](#reference-folders-routing-audits-thresholds)
+12. [Challenges faced throughout the project](#challenges-faced-throughout-the-project)
+13. [Open challenges and limitations](#open-challenges-and-limitations)
+14. [Reference: folders, routing, audits, thresholds](#reference-folders-routing-audits-thresholds)
 
 ---
 
@@ -68,10 +69,12 @@ flowchart LR
   subgraph ner [NER]
     ORG[ORG mentions CSVs]
     Flt[prefilter / dropset]
+    LLM[Gemini mention label optional]
   end
   Raw --> Clean --> Biz
   Clean --> Iso
   Biz --> Man --> ABCD --> Exp --> ORG --> Flt
+  Flt -.-> LLM
 ```
 
 **Typical flow**
@@ -82,6 +85,11 @@ flowchart LR
 4. **`abcd.py`** (or `build_candidate_windows.py`) — cue-based **`candidate_windows.*`** + **`window_audit_summary.txt`**.
 5. **`build_explicit_candidate_windows.py`** / **`abcde.py`** — strict + contextual rows only, stable schema, **`explicit_candidate_windows.csv`**.
 6. **`abcdef.py`** — spaCy + HF NER → window-level raw/nonraw + optional org-diff log. **`extract_explicit_mentions_raw.py`** is a slimmer variant (mention-per-row only).
+7. **`build_union_prefilter_output.py`** — apply the `org_mention_prefilter` policy to mention-list rows and write **`ORG_detection/union_filtered_prefilter_output.csv`** (includes `org_mentions_union_filtered` + `prefilter_*` audit columns).
+8. **`clean_prefilter_columns.py`** — strip verbose prefilter audit fields and write **`ORG_detection/union_filtered_prefilter_output_cleaned.csv`**.
+9. Optionally **`gemini_mention_label.py`** — after junk filtering, batch **Gemini** classification of each surviving mention (`mention_org` + `source_company` + `source_sentence`) into company / product brand / generic category / agency / other, with a deterministic **`pipeline_role`** for downstream routing. Requires **`GEMINI_API_KEY`** and `pip install google-generativeai`.
+
+If you want steps 7+8 in one command, use **`run_prefilter_pipeline.py`**.
 
 ---
 
@@ -113,6 +121,10 @@ flowchart LR
 | **`build_explicit_candidate_windows.py`** / **`abcde.py`** | Filter to **strict + contextual explicit** rows; dedupe; assign **`window_id`** → **`explicit_candidate_windows.csv`**. |
 | **`abcdef.py`** | **Window-level** ORG harvest: raw columns, **`_nonraw`** dedupe, **`_org_diff`** span analysis. |
 | **`extract_explicit_mentions_raw.py`** | **One row per mention span** (no window aggregation / org-diff). |
+| **`build_union_prefilter_output.py`** | Build **`union_filtered_prefilter_output.csv`** from mention-list columns, applying `org_mention_prefilter.label_mention()` and emitting `org_mentions_union_filtered` + `prefilter_*` audit fields. |
+| **`clean_prefilter_columns.py`** | Remove verbose `prefilter_*` processing columns and export compact **`*_cleaned.csv`** files for downstream review/modeling. |
+| **`run_prefilter_pipeline.py`** | One-command wrapper for prefilter build + cleanup. Auto-discovers 2023/2024 `explicit_mentions_raw_nonraw` inputs (or accepts `--input`) and writes both working and cleaned outputs. |
+| **`gemini_mention_label.py`** | Optional **LLM pass** (Google Gemini, free-tier–friendly defaults): classifies junk-filtered mentions into `llm_*` fields and **`pipeline_role`** (`explicit_company_candidate`, `explicit_support_via_product`, `implicit_only`, `ignore_or_review`). Batched JSON I/O, retries, disk cache. Env: **`GEMINI_API_KEY`**. See [§ Gemini mention labeling](#gemini-mention-labeling). |
 | **`org_mention_prefilter.py`** | Labels each raw mention string: `keep` / `drop_obvious_junk` / `review` (see [§ Mention quality](#mention-quality-prefilter-and-dropset)). |
 | **`org_mention_junk_dropset.py`** | **Data-only** policy for the prefilter: exact sets, regexes, review list; versioned as `DROPSPEC_VERSION` / `DROPSPEC_EVIDENCE` (examples in [§ Mention quality](#mention-quality-prefilter-and-dropset)). |
 | **`count_competition_only.py`** | Heuristic **count** of extracts that look **competition-only** (no business header in snippet). |
@@ -149,6 +161,18 @@ Interpretation of the audit file (counts, tiers, fallback) is documented below u
 
 **`build_explicit_candidate_windows.py`** keeps only **strict_explicit** and **contextual_explicit** rows, normalizes column names across ABCD vs combined exports, drops duplicate evidence rows, and emits a stable **`explicit_candidate_windows.csv`** for NER.
 
+**Output file:** `explicit_candidate_windows.csv`
+
+**Core columns (what they mean):**
+
+- `window_id` — stable sequential explicit-window ID (`EXPW...`).
+- `source_company`, `source_cik`, `filing_year` — filing identity.
+- `accession_number`, `filing_id` — filing-level join keys.
+- `section`, `heading` — where the evidence window came from.
+- `cue_phrase`, `cue_group` — trigger phrase and cue class.
+- `trigger_sentence`, `window_text` — sentence-level trigger plus exported context text.
+- `window_priority`, `export_bucket` — ranking and output bucket metadata.
+
 ---
 
 ## Stage 5: Organization mentions (NER)
@@ -163,15 +187,139 @@ Outputs (given `-o my_raw.csv`):
 2. **`my_raw_nonraw.csv`** — same windows, **unique** mention strings.
 3. **`my_raw_org_diff.csv`** (or `--org-diff-log`) — span-level diff between raw and deduped views.
 
+**`my_raw.csv` (window-level raw mention bundle) columns:**
+
+- `org_mentions_raw_count` — number of mention spans retained for the window (raw, no text dedupe).
+- `org_mentions_raw` — semicolon-joined mention strings in span order.
+- `mention_starts_raw`, `mention_ends_raw` — semicolon-joined offset lists aligned to `org_mentions_raw`.
+- `extractors_raw` — semicolon-joined extractor tags (e.g., spaCy / HF tag names).
+
+**`my_raw_nonraw.csv` (window-level deduped mention bundle) columns:**
+
+- `org_mentions_count` — count of unique mention strings per window (case-insensitive dedupe).
+- `org_mentions` — semicolon-joined unique mention strings.
+
+**`my_raw_org_diff.csv` columns:**
+
+- `raw_org_span_count` — total raw spans in window.
+- `nonraw_unique_org_count` — unique mention count after nonraw dedupe.
+- `raw_mention`, `mention_start`, `mention_end`, `extractor_name` — diff row detail.
+- `extra_source`, `diff_reason` — why this row appears in the diff log.
+
 ```bash
 pip install -r requirements-explicit-mentions.txt
 python -m spacy download en_core_web_sm
 python abcdef.py -i explicit_candidate_windows.csv -o ORG_out_raw.csv
+# NER only on a precomputed union column (offsets are into that column; full window still in window_text):
+# With org_mentions_union_filtered on the CSV, default --ner-text-column auto already uses it:
+python abcdef.py -i windows_with_union.csv -o ORG_out_raw.csv
+# Force full-window NER:
+python abcdef.py -i windows.csv -o ORG_out_raw.csv --ner-text-column window_text
 ```
 
 ### `extract_explicit_mentions_raw.py` (mention-per-row)
 
-Same models and normalization, but output is **one row per mention span** (`raw_mention`, `mention_start`, `mention_end`, …). No bundled nonraw/org-diff artifacts—use when you only need a flat mention list.
+Same models and normalization, but output is **one row per mention span** (`raw_mention`, `mention_start`, `mention_end`, …). No bundled nonraw/org-diff artifacts—use when you only need a flat mention list. **`--ner-text-column auto`** (default): use **`org_mentions_union_filtered`** when that column exists (NER only sees the prefilter-approved mention list string); otherwise **`window_text`**. Output includes **`ner_input_text`** (the string NER saw); **`window_text`** remains the full window.
+
+### `build_union_prefilter_output.py` (prefilter working file)
+
+Applies `org_mention_prefilter.label_mention()` to each semicolon-joined mention in a CSV row and writes a working file for audit + cleanup.
+
+Default behavior:
+
+- Input: `explicit_mentions_raw_nonraw.csv`
+- Output: `ORG_detection/union_filtered_prefilter_output.csv`
+- Mention column auto-detect order: `org_mentions_union`, `org_mentions_union_raw`, `org_mentions`, `org_mentions_raw`
+- Uses `source_company` (if present) for self-name suppression
+
+Writes / normalizes these key columns:
+
+- `org_mentions_union_count`
+- `org_mentions_union`
+- `org_mentions_union_filtered`
+- `prefilter_input_column`, `prefilter_total_mentions`
+- `prefilter_keep_count`, `prefilter_drop_count`, `prefilter_review_count`
+- `prefilter_keep_mentions`, `prefilter_drop_mentions`, `prefilter_review_mentions`
+- `prefilter_keep_reasons`, `prefilter_drop_reasons`, `prefilter_review_reasons`
+
+```bash
+python build_union_prefilter_output.py \
+  -i explicit_mentions_raw_nonraw.csv \
+  -o ORG_detection/union_filtered_prefilter_output.csv
+```
+
+### Cleaned prefilter output (post-filter export)
+
+`clean_prefilter_columns.py` writes a compact file (default suffix: `_cleaned`) intended for downstream review/modeling without verbose prefilter audit fields.
+
+**Typical file names:**
+
+- `ORG_detection/union_filtered_prefilter_output.csv` (input / working file)
+- `ORG_detection/union_filtered_prefilter_output_cleaned.csv` (cleaned output)
+
+```bash
+python clean_prefilter_columns.py \
+  ORG_detection/union_filtered_prefilter_output.csv
+```
+
+### One-command prefilter runner
+
+`run_prefilter_pipeline.py` wraps both `build_union_prefilter_output.py` and `clean_prefilter_columns.py`.
+
+```bash
+# Auto-discover year-tagged 2023/2024 nonraw mention CSVs
+python run_prefilter_pipeline.py
+
+# Explicit input(s)
+python run_prefilter_pipeline.py --input explicit_mentions_raw_nonraw.csv
+
+# Explicit inputs + fixed output directory
+python run_prefilter_pipeline.py --input path/to/nonraw.csv --output-dir ORG_detection
+```
+
+**Normalized cleaned columns:**
+
+- `org_mentions_union_count` — mention count before filtering (union list count).
+- `org_mentions_union` — semicolon-joined union mentions.
+- `org_mentions_union_filtered` — semicolon-joined mentions that survived filtering.
+- `org_mentions_removed_count` — computed as `union_count - filtered_count`.
+
+### Gemini mention labeling
+
+**Script:** `gemini_mention_label.py`
+
+Use **after** junk filtering (and ideally on a CSV that already has stable columns for the extracted span and its sentence). For each row, the script sends **`mention_org`** (fallback: `raw_mention`), **`source_company`** (fallback: `source_company_name`), and **`source_sentence`** (fallback: `sentence_text`, then `trigger_sentence`) to **Gemini** in batches, requests **strict JSON**, retries on malformed output, and **caches** by hash of `(mention, company, sentence)`.
+
+**Adds columns:** `llm_label`, `llm_owner_company_candidate`, `llm_confidence`, `llm_reason`, **`pipeline_role`** (downstream routing).
+
+**`pipeline_role` mapping (deterministic from LLM fields):**
+
+| `llm_label` | `pipeline_role` |
+|-------------|-----------------|
+| `COMPANY` | `explicit_company_candidate` |
+| `PRODUCT_BRAND` with non-empty `llm_owner_company_candidate` | `explicit_support_via_product` |
+| `GENERIC_PRODUCT_CATEGORY` | `implicit_only` |
+| `Non coporate AGENCY`, `OTHER`, ambiguous product brand (no owner), etc. | `ignore_or_review` |
+
+The prompt favors **conservative** labels (`OTHER` when unclear). Model and batch size are **configurable**; **`--test`** processes only the first 20 rows.
+
+```bash
+pip install google-generativeai
+export GEMINI_API_KEY=...   # Google AI Studio key
+python gemini_mention_label.py -i mentions_filtered.csv -o mentions_labeled.csv --batch-size 8 --test
+```
+
+#### Product vs company: limitations and the ideal label struggle
+
+This pipeline keeps hitting the same wall: **CoNLL-style NER only emits coarse tags** (`ORG`, `MISC`, …), so **product brands, generics, and firms** are tangled before any downstream step. **`gemini_mention_label.py`** is an optional **LLM** layer for typing mentions in **sentence context**; it is still **not** entity linking (no CIK), and labels remain **judgment calls** (e.g. brand vs firm depends on graph design).
+
+**Union / filtered lists** (e.g. `org_mentions_union_filtered` as `iPhone ; Fitbit ; MetAlert ; GPS SmartSole® ; ADA`) are useful for alignment with the prefilter, but:
+
+- **NER on the joined string alone** is not natural prose; boundaries and tags can be odd.
+- **Disambiguation needs sentence context** (`window_text` / `sentence_text` / `ner_input_text`); **short acronyms** (e.g. **ADA**: statute vs association vs disease) are often **not** resolvable from the list string alone.
+- **“Ideal” typing is not unique**: e.g. **Fitbit** can be argued as **PRODUCT_BRAND** (wearable brand) or **COMPANY** (competitor entity), depending whether the graph stores **firms** or **brands + firms**. **iPhone** is usually a **product line**, not “Apple” the company.
+
+So the expected outcome is **iterative**: tune prompts/thresholds, accept residual **`OTHER`**, or add **supervised / gazetteer / human** review for production-quality splits.
 
 ---
 
@@ -232,10 +380,37 @@ Audit with self-suppression: `python org_mention_prefilter.py windows.csv --sour
 - **10-K processing:** `beautifulsoup4`, `lxml`, `tqdm` (see scripts’ imports).
 - **ABCD:** standard library + optional **`tqdm`**.
 - **NER:** `requirements-explicit-mentions.txt` — `spacy`, `transformers`, `torch`.
+- **Gemini mention labeling (optional):** `google-generativeai`; set **`GEMINI_API_KEY`** (see [§ Gemini mention labeling](#gemini-mention-labeling)).
+
+---
+
+## Challenges faced throughout the project
+
+This section records **practical problems encountered while building** the pipeline—not only abstract limitations. They motivated the **heuristic-first** design, **versioned dropsets**, and later **optional LLM / column** choices for mention typing.
+
+**Ingestion and structure.** Real 10-K HTML rarely matches a single template. **Section boundaries** drift (Item 1 titles, embedded TOCs, multi-column layouts), so extraction is **brittle** and some filings land in **isolated** buckets or weak **business** cuts. **Routing** (`no_outgoing_edges`, competition-only heuristics) is a judgment call: false negatives and false positives trade off.
+
+**Configuration and portability.** Early scripts (`a.py`, `script.py`) embed **machine-specific paths**; **`restore_2023_outputs.py`** and other tools assume a particular **`SEC/`** layout. Moving between machines or years requires **manual path edits**—a recurring friction point.
+
+**Cueing and windows.** Cue phrases are **English-centric** and tuned on recurring disclosure phrasing. **Strict** cues miss rare wording; **broad** tiers pull in boilerplate. **Overlap dedup** saves annotation cost but can **merge** distinct evidence in edge cases. **Heading fallback** helps recall but is not a complete fix.
+
+**NER and mention quality.** Off-the-shelf **CoNLL NER** tags **ORG/MISC**, not “company” or “product”; **brands**, **diseases**, **geographies**, and **filing boilerplate** are often tagged as organizations. A **single** model misses spans; **dual NER** + merge adds complexity. The **junk dropset** and **prefilter** are **sample-grounded** and **iterative**—new domains (e.g. biotech vs retail vs SPAC language) surface new failure modes. **Self-filer suppression** and **whitelists** are needed for edge cases.
+
+**Unions, filtering, and second-pass NER.** Aligning **`org_mentions_union`** with **`org_mentions_union_filtered`** and prefilter audit columns was a **workflow struggle**: the “filtered” list is the **company-candidate** set, but running NER on **semicolon-joined** text is **not** natural prose, so boundaries and tags can look odd. Choosing **window text** vs **filtered union** for NER is a deliberate tradeoff between **context** and **scope**.
+
+**Product vs company typing.** **`gemini_mention_label.py`** improves **sentence-grounded** typing vs list-only heuristics, but **API quotas**, **latency**, and **label ambiguity** remain. There is **no single “ideal”** product/company split without **task definition** (e.g. graph firms vs brands). **Short acronyms** (e.g. **ADA**) are often **not** disambiguable from a list string alone. Closing the gap still needs **iteration**, **gazetteers**, or **manual review** for edge cases.
+
+**Downstream semantics and scope.** **Mention** ≠ **resolved entity** (no **CIK** linking in this repo). **Competition cue** near a name ≠ **validated competitive edge** (customers, suppliers, partners). Those gaps are **known**; filling them is **follow-on work**.
+
+**Scale and exports.** Full-window NER over **many** explicit rows is **slow** on CPU; GPU helps but adds setup friction. Intermediate CSVs grow **wide** (union columns, prefilter audit fields, LLM columns), so **spot-checking** and **column filtering** became necessary for reviewable artifacts.
+
+**Tooling and collaboration.** Keeping **Git** remotes and **credentials** configured for push, and avoiding **accidentally committing** large sampled CSVs or machine-local paths, is part of day-to-day friction—not solved in code, but part of the project reality.
 
 ---
 
 ## Open challenges and limitations
+
+The numbered list below is a **compact checklist** of technical limitations; the narrative above expands on **how they showed up** in this project.
 
 1. **Section extraction brittleness** — Unusual Item 1 titles, embedded TOCs, or multi-column HTML can mis-bound sections. Isolated buckets capture some failures but are not a complete inventory of “missed competition.”
 2. **Cue recall vs precision** — Patterns are tuned for common phrasing; rare or non-English firm names in competitor lists may appear in sentences **without** hitting strict cues (mitigated partly by contextual/broad tiers and heading fallback in `abcd.py`).
@@ -244,6 +419,7 @@ Audit with self-suppression: `python org_mention_prefilter.py windows.csv --sour
 5. **False positives and junk** — Legal entities, industries, and geographies are often tagged as organizations. The **junk dropset** is **conservative** and **sample-grounded**; it will need **iteration** as domains change (e.g. biotech vs retail language).
 6. **Configuration drift** — `a.py` / `script.py` use **Windows-style absolute paths** in-repo; **`restore_2023_outputs.py`** uses relative `SEC/` layout. Expect to edit paths when moving machines.
 7. **Downstream graph semantics** — Mentioning a company near a competition cue **does not** guarantee a competitive relationship (customers, suppliers, partners). Additional filtering or labeling is required for research-grade edges.
+8. **Product vs company subtype labeling** — Optional **`gemini_mention_label.py`** is **conservative** (`OTHER` when unclear); **NER + semicolon unions** do not define a single “gold” product/company split. See [§ Product vs company: limitations](#product-vs-company-limitations-and-the-ideal-label-struggle) above.
 
 ---
 

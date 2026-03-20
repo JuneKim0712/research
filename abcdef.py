@@ -28,10 +28,15 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 # --- Optional heavy imports (clear error if missing) -------------------------------------------
 try:
     import spacy
-except ImportError as e:  # pragma: no cover
+except Exception as e:  # pragma: no cover
     spacy = None  # type: ignore
     _SPACY_IMPORT_ERROR = e
 else:
@@ -64,7 +69,7 @@ OUTPUT_FIELDS_RAW = [
     "cue_group",
     "trigger_sentence",
     "window_text",
-    "org_mention_count",
+    "org_mentions_raw_count",
     "org_mentions_raw",
     "mention_starts_raw",
     "mention_ends_raw",
@@ -81,7 +86,7 @@ OUTPUT_FIELDS_NONRAW = [
     "cue_group",
     "trigger_sentence",
     "window_text",
-    "org_mention_count",
+    "org_mentions_count",
     "org_mentions",
 ]
 
@@ -296,7 +301,7 @@ def aggregate_mentions_by_window(
     aggregated ORG mention list.
 
         Returns one row per input window with added columns:
-            org_mention_count: count of unique mentions
+            org_mentions_count: count of unique mentions
             org_mentions: semicolon-separated list of unique mentions
     """
     # Build window -> unique mentions mapping
@@ -329,7 +334,8 @@ def aggregate_mentions_by_window(
     for w_dict in windows:
         w_id = (w_dict.get("window_id") or "").strip()
         row_out = dict(w_dict)
-        row_out["org_mention_count"] = str(len(mentions_by_window.get(w_id, [])))
+        row_out["org_mentions_count"] = str(len(mentions_by_window.get(w_id, [])))
+        row_out["org_mention_count"] = row_out["org_mentions_count"]
         row_out["org_mentions"] = " ; ".join(mentions_by_window.get(w_id, []))
         out_rows.append(row_out)
 
@@ -468,6 +474,7 @@ def aggregate_raw_mentions_by_window(
             "cue_group": w_dict.get("cue_group", ""),
             "trigger_sentence": w_dict.get("trigger_sentence", ""),
             "window_text": w_dict.get("window_text", ""),
+            "org_mentions_raw_count": str(len(items)),
             "org_mention_count": str(len(items)),
             "org_mentions_raw": " ; ".join(i["text"] for i in items if i["text"]),
             "mention_starts_raw": " ; ".join(i["start"] for i in items if i["start"]),
@@ -496,12 +503,13 @@ def print_preview(title: str, path: Path, n: int = 5) -> None:
 
 def process_windows(
     windows: list[dict[str, str]],
-    nlp: Any,
+    nlp: Any | None,
     ner_pipe: Any,
     hf_extractor_tag: str = DEFAULT_HF_EXTRACTOR_TAG,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for wrow in windows:
+    iterator = tqdm(windows, desc="Processing windows for NER") if tqdm else windows
+    for wrow in iterator:
         window_id = (wrow.get("window_id") or "").strip()
         window_orig = wrow.get("window_text") or ""
         clean, o_starts, o_ends = normalize_with_offset_map(window_orig)
@@ -510,16 +518,17 @@ def process_windows(
         if not clean.strip():
             continue
 
-        doc = nlp(clean)
+        doc = nlp(clean) if nlp is not None else None
 
         span_extractors: list[tuple[int, int, str, int, int]] = []
 
-        for cs, ce in extract_spacy_org(doc):
-            mapped = clean_span_to_orig(cs, ce, o_starts, o_ends, orig_len)
-            if mapped is None:
-                continue
-            o0, o1 = mapped
-            span_extractors.append((o0, o1, "spacy", cs, ce))
+        if doc is not None:
+            for cs, ce in extract_spacy_org(doc):
+                mapped = clean_span_to_orig(cs, ce, o_starts, o_ends, orig_len)
+                if mapped is None:
+                    continue
+                o0, o1 = mapped
+                span_extractors.append((o0, o1, "spacy", cs, ce))
 
         for cs, ce, _lbl in extract_hf_org_misc(ner_pipe, clean):
             mapped = clean_span_to_orig(cs, ce, o_starts, o_ends, orig_len)
@@ -534,9 +543,11 @@ def process_windows(
         for (o0, o1) in sorted(merged.keys(), key=lambda t: (t[0], t[1])):
             ex_names, cs_ent, ce_ent = merged[(o0, o1)]
             raw_mention = window_orig[o0:o1]
-            sentence_text = sentence_for_span_orig(
-                window_orig, doc, cs_ent, ce_ent, o_starts, o_ends
-            )
+            sentence_text = ""
+            if doc is not None:
+                sentence_text = sentence_for_span_orig(
+                    window_orig, doc, cs_ent, ce_ent, o_starts, o_ends
+                )
 
             rows.append({
                 "window_id": window_id,
@@ -581,6 +592,11 @@ def main() -> int:
         help="spaCy model name (larger models often improve recall)",
     )
     parser.add_argument(
+        "--disable-spacy",
+        action="store_true",
+        help="Skip spaCy and run HF NER only (useful when spaCy is unavailable).",
+    )
+    parser.add_argument(
         "--device",
         default="-1",
         help="HF pipeline device: -1 CPU, 0+ GPU index",
@@ -620,8 +636,16 @@ def main() -> int:
     except ValueError:
         dev = -1
 
-    print("Loading spaCy…")
-    nlp = load_spacy(args.spacy_model)
+    nlp = None
+    if not args.disable_spacy:
+        try:
+            print("Loading spaCy…")
+            nlp = load_spacy(args.spacy_model)
+        except Exception as e:
+            print(f"Warning: spaCy unavailable ({e}). Continuing with HF NER only.")
+            nlp = None
+    else:
+        print("Skipping spaCy (--disable-spacy).")
     print(f"Loading Hugging Face NER ({args.hf_ner_model})…")
     ner_pipe = load_hf_ner(model_name=args.hf_ner_model, device=dev)
 

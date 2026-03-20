@@ -2,7 +2,7 @@
 Label raw ORG mention strings before alias resolution / edge construction.
 
   keep — send downstream
-  drop_obvious_junk — high-confidence trash from the dropset (see org_mention_junk_dropset)
+  drop_obvious_junk — high-confidence trash from the in-file dropset
   review — ambiguous; keep out of automatic graph unless you promote via whitelist
 
 Usage:
@@ -22,16 +22,276 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Final, Literal
 
-from org_mention_junk_dropset import (
-    DROPSPEC_EVIDENCE,
-    DROPSPEC_VERSION,
-    DROP_REGEX,
-    EXACT_DROP_CASEFOLD,
-    REVIEW_EXACT_CASEFOLD,
-    WHITELIST_EXACT_CASEFOLD,
+MentionLabel = Literal["keep", "drop_obvious_junk", "review"]
+
+DROPSPEC_VERSION: Final[str] = "4.1.1"
+DROPSPEC_EVIDENCE: Final[str] = (
+    "raw.csv + nonraw.csv "
+    "(RoBERTa NER, 2000 windows); inherits ORG_Strict_Raw_600* curation"
 )
 
-MentionLabel = Literal["keep", "drop_obvious_junk", "review"]
+WHITELIST_EXACT_CASEFOLD: Final[frozenset[str]] = frozenset(
+    {
+        "x",
+        "abi",
+        "aws",
+    }
+)
+
+EXACT_DROP_CASEFOLD: Final[frozenset[str]] = frozenset(
+    {
+        "company",
+        "bank",
+        "charter",
+        "board",
+        "committee",
+        "registrant",
+        "filing",
+        "shareholder",
+        "shareholders",
+        "stockholder",
+        "stockholders",
+        "llc",
+        "llp",
+        "l.l.c.",
+        "l.p.",
+        "plc",
+        "p.c.",
+        "p.l.l.c.",
+        "inc",
+        "inc.",
+        "corp",
+        "corp.",
+        "co.",
+        "co",
+        "ltd",
+        "ltd.",
+        "corporation",
+        "incorporated",
+        "limited",
+        "nv",
+        "n.v.",
+        "s.a.",
+        "ag",
+        "kgaa",
+        "sa",
+        "internet",
+        "european",
+        "north american",
+        "non-north american",
+        "asian",
+        "latin american",
+        "middle eastern",
+        "african",
+        "scandinavian",
+        "oceanian",
+        "in",
+        "chinese",
+        "canadian",
+        "spanish",
+        "the internet",
+        "fintech",
+        "martech",
+        "bdc",
+        "hotel",
+        "residential",
+        "learners",
+        "type",
+        "lng",
+        "eds",
+        "operations",
+        "functional",
+        "global technology",
+        "research and development",
+        "human capital",
+        "401k",
+        "401(k)",
+        "use authorization",
+        "pneumatic comfort technologies",
+        "acoustics",
+        "south korean company",
+        "commercial automobile program",
+        "car's commercial automobile program",
+        "the business combination",
+        "business combination",
+        "initial business combination",
+        "initial public offering",
+        "the initial public offering",
+        "private placement",
+        "private placement warrants",
+        "public offering",
+        "comprehensive plan for add",
+        "supply chain services",
+        "performance services",
+        "com",
+        "net",
+        "org",
+        "fda",
+        "usda",
+        "fha",
+        "national cancer institute",
+        "the national cancer institute",
+        "federal reserve",
+        "the federal reserve",
+        "federal reserve bank",
+        "the federal reserve bank",
+        "u.s. international trade commission",
+        "the u.s. international trade commission",
+        "usitc",
+        "european commission",
+        "the european commission",
+        "u.s. department of energy",
+        "u.s. department of treasury",
+        "the u.s. department of treasury",
+        "u.s. navy",
+        "u.s. government",
+        "the u.s. government",
+        "gse",
+        "gses",
+        "sec",
+        "ftc",
+        "irs",
+        "epa",
+        "osha",
+        "nih",
+        "cdc",
+        "hhs",
+        "cms",
+        "ofac",
+        "cftc",
+        "finra",
+        "occ",
+        "fdic",
+        "fcc",
+        "fema",
+        "dea",
+        "atf",
+        "fbi",
+        "nhtsa",
+        "uspto",
+        "doj",
+        "treasury",
+        "the treasury",
+        "medicare",
+        "medicaid",
+        "congress",
+        "1940 act",
+        "orange book",
+        "the orange book",
+        "covid-19",
+        "lgbtq",
+        "anda",
+        "nda",
+        "snda",
+        "bla",
+        "maa",
+        "phase 1",
+        "phase 2",
+        "phase 3",
+        "phase 1b",
+        "phase 2b",
+        "phase 3b",
+        "cdk",
+        "cdk9",
+        "cd",
+        "aml",
+        "mll",
+        "npm1",
+        "pah",
+        "ms",
+        "btk",
+        "pcnsl",
+        "pcns",
+        "bcl",
+        "fl",
+        "ce",
+        "sars",
+        "cov",
+        "ec",
+        "meni",
+        "ccenture",
+        "ffymetrix, inc",
+        "ffymetrix, inc.",
+        "ica biosystems, inc",
+        "ica biosystems, inc.",
+        "eophysical technologies",
+        "uvasive, inc",
+        "uvasive, inc.",
+        "yndax pharmaceuticals, inc.",
+        "yndax pharmaceuticals, inc",
+        "ioenergy devco",
+        "rbella mutual insurance company",
+        "be",
+        "cton dickinson",
+        "rid dynamics",
+        "knowb",
+        "cy",
+        "bersecurity",
+        "sanita",
+        "ware",
+        "ava",
+        "ility, llc",
+        "fosys",
+        "eistlich pharma ag",
+        "ualtrics international inc",
+        "ioventus inc",
+        "rimient",
+        "st",
+        "rata oncology, inc",
+        "pre",
+        "therapeutics",
+        "pt",
+        "pa",
+    }
+)
+
+DROP_REGEX: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
+    (re.compile(r"^\W+$", re.UNICODE), "punctuation_only"),
+    (
+        re.compile(
+            r"^(?:[\*_]*)?"
+            r"(?:"
+            r"\(\s*[+\-\u2212]?\d[\d\s,\.\:/%_]*(?:[eE][+\-]?\d+)?\s*\)"
+            r"|"
+            r"[+\-\u2212]?\d[\d\s,\.\:/%_]*(?:[eE][+\-]?\d+)?"
+            r")"
+            r"[\*_]*$"
+        ),
+        "pure_numeric",
+    ),
+    (re.compile(r"^phase\s*\d+[a-z]?\b", re.I), "clinical_phase_prefix"),
+    (re.compile(r"^phase\s+[ivx]+\b", re.I), "clinical_phase_roman"),
+    (re.compile(r".*\bdose\s+escalation\b", re.I), "clinical_dose_escalation"),
+    (re.compile(r"^early[\s-]stage\s+clinical\b", re.I), "clinical_early_stage"),
+    (re.compile(r"\bclinical\s+trial\b", re.I), "clinical_trial_phrase"),
+    (re.compile(r"^u\.s\.\s+department\s+of\s+", re.I), "us_department_of"),
+    (re.compile(r"^the\s+u\.s\.\s+department\s+of\s+", re.I), "the_us_department_of"),
+    (re.compile(r"(?i)\sact$"), "statute_act_suffix"),
+    (re.compile(r"(?i)^stage\s*\d+[a-z]?\b"), "clinical_stage"),
+    (re.compile(r"(?i)^cohort\s+[a-z0-9\-]+$"), "cohort_label"),
+    (re.compile(r"(?i)^part\s+(\d+[a-z]?|[a-z]\d*)$"), "trial_part"),
+    (re.compile(r"(?i)\bfda\s+approval\b"), "fda_approval_phrase"),
+    (re.compile(r"(?i)^inhibitors?$"), "inhibitor_word"),
+    (re.compile(r"(?i)^patients?$"), "patients_word"),
+    (re.compile(r"(?i)\bgeneric\s+(?:drug|product|version)\b"), "generic_drug_phrase"),
+    (re.compile(r"(?i)\bmarket\s+exclusivity\b"), "market_exclusivity_phrase"),
+)
+
+REVIEW_EXACT_CASEFOLD: Final[frozenset[str]] = frozenset(
+    {
+        "va",
+        "car",
+        "ai",
+        "it",
+        "hc",
+        "sg",
+        "lyr",
+        "am",
+        "dhcm",
+        "dlf",
+        "ge",
+    }
+)
 
 _QUOTE_STRIP: Final[re.Pattern[str]] = re.compile(
     r'^[\s\"\'\u201c\u201d\u2018\u2019\u2022\u2023\u25e6\u2043\u2219]+|[\s\"\'\u201c\u201d\u2018\u2019\u2022\u2023\u25e6\u2043\u2219]+$'
@@ -208,7 +468,7 @@ def merge_dot_com_spans(spans: list[tuple[str, int, int]]) -> list[tuple[str, in
 @dataclass
 class MentionFilter:
     """
-    Stateful filter so you can extend dropset without editing org_mention_junk_dropset.py.
+    Stateful filter so you can extend the in-file dropset via runtime overrides.
     Later whitelists win over built-in drops.
     """
 

@@ -17,8 +17,20 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 EXPLICIT_BUCKETS = frozenset({"strict_explicit", "contextual_explicit"})
 EXPLICIT_CUE_GROUPS = frozenset({"strict_explicit", "contextual_explicit"})
+
+INPUT_COLUMN_ALIASES = {
+    "source_company": ("source_company", "source_company_name"),
+    "section": ("section", "section_type"),
+    "heading": ("heading", "heading_text"),
+    "cue_phrase": ("cue_phrase", "cue_text"),
+}
 
 OUTPUT_FIELDS = [
     "window_id",
@@ -73,8 +85,16 @@ def _coerce_priority(val: Any) -> str:
         return str(val).strip()
 
 
+def _pick_value(raw: dict[str, Any], key: str) -> str:
+    for alias in INPUT_COLUMN_ALIASES.get(key, (key,)):
+        v = raw.get(alias)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return ""
+
+
 def normalize_row(raw: dict[str, Any]) -> dict[str, str]:
-    company = raw.get("source_company_name") or raw.get("source_company") or ""
+    company = _pick_value(raw, "source_company")
     acc = raw.get("accession_number") or ""
     fid = raw.get("filing_id") or ""
     cue_group = str(raw.get("cue_group") or "").strip()
@@ -88,9 +108,9 @@ def normalize_row(raw: dict[str, Any]) -> dict[str, str]:
         "filing_year": str(raw.get("filing_year") or "").strip(),
         "accession_number": str(acc).strip(),
         "filing_id": str(fid).strip(),
-        "section": str(raw.get("section_type") or raw.get("section") or "").strip(),
-        "heading": str(raw.get("heading_text") or raw.get("heading") or "").strip(),
-        "cue_phrase": str(raw.get("cue_text") or raw.get("cue_phrase") or "").strip(),
+        "section": _pick_value(raw, "section"),
+        "heading": _pick_value(raw, "heading"),
+        "cue_phrase": _pick_value(raw, "cue_phrase"),
         "cue_group": cue_group,
         "trigger_sentence": str(raw.get("trigger_sentence") or ""),
         "window_text": str(raw.get("window_text") or ""),
@@ -124,11 +144,14 @@ def sort_key(row: dict[str, str]) -> tuple:
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
+        lines = f.readlines()
+    
+    iterator = tqdm(lines, desc=f"Loading {path.name}") if tqdm else lines
+    for line in iterator:
+        line = line.strip()
+        if not line:
+            continue
+        rows.append(json.loads(line))
     return rows
 
 
@@ -177,7 +200,8 @@ def discover_inputs(args_inputs: list[Path], cwd: Path) -> list[Path]:
 
 def build_explicit_rows(sources: Iterable[dict[str, Any]]) -> list[dict[str, str]]:
     normalized: list[dict[str, str]] = []
-    for raw in sources:
+    iterator = tqdm(sources, desc="Normalizing rows") if tqdm else sources
+    for raw in iterator:
         if not is_explicit_window(raw):
             continue
         normalized.append(normalize_row(raw))
@@ -186,14 +210,17 @@ def build_explicit_rows(sources: Iterable[dict[str, Any]]) -> list[dict[str, str
 
     seen: set[tuple] = set()
     deduped: list[dict[str, str]] = []
-    for row in normalized:
+    dedup_iterator = tqdm(normalized, desc="Deduplicating rows") if tqdm else normalized
+    for row in dedup_iterator:
         k = exact_dedupe_key(row)
         if k in seen:
             continue
         seen.add(k)
         deduped.append(row)
 
-    for i, row in enumerate(deduped, start=1):
+    # Add window IDs
+    window_id_iterator = tqdm(enumerate(deduped, start=1), desc="Assigning window IDs", total=len(deduped)) if tqdm else enumerate(deduped, start=1)
+    for i, row in window_id_iterator:
         row["window_id"] = f"EXPW{i:07d}"
 
     return deduped
@@ -228,7 +255,8 @@ def main() -> None:
     paths = discover_inputs(list(args.inputs), cwd)
 
     all_raw: list[dict[str, Any]] = []
-    for p in paths:
+    iterator = tqdm(paths, desc="Loading input files") if tqdm else paths
+    for p in iterator:
         if not p.is_file():
             raise SystemExit(f"Missing input file: {p}")
         all_raw.extend(load_any(p))
