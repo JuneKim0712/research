@@ -4,10 +4,11 @@ Raw organization / company mention harvest from explicit_candidate_windows.csv.
 
 Runs two off-the-shelf extractors on each window_text (recall-first union):
   1) spaCy English NER — keep spans labeled ORG (optionally GPE for some holdings; off by default).
-  2) Hugging Face dslim/bert-base-NER — keep ORG and MISC (MISC often catches company-like phrases).
+  2) Hugging Face token-classification NER (default: Jean-Baptiste/roberta-large-ner-english, RoBERTa
+     on CoNLL-2003) — keep ORG and MISC (MISC often catches company-like phrases).
 
 Same (window_id, char span in *original* window_text) from both models is merged into one row
-with extractor_name like "dslim_bert_ner+spacy". Same mention string at different spans stays
+with extractor_name like "roberta_ner+spacy" (HF tag set by --hf-extractor-tag). Same mention string at different spans stays
 as separate rows. Mentions in different windows are never deduplicated.
 
 Dependencies (see requirements-explicit-mentions.txt):
@@ -15,7 +16,8 @@ Dependencies (see requirements-explicit-mentions.txt):
   python -m spacy download en_core_web_sm   # or en_core_web_md / en_core_web_lg for recall
 
 Input default:  ./explicit_candidate_windows.csv
-Output default: ./explicit_mentions_raw.csv
+Output default: ./explicit_mentions_raw.csv (window-level span list), ./explicit_mentions_raw_nonraw.csv (deduped),
+  and ./explicit_mentions_raw_org_diff.csv (per-window ORG surplus vs nonraw, unless --org-diff-log is set).
 """
 
 from __future__ import annotations
@@ -42,6 +44,10 @@ except ImportError as e:  # pragma: no cover
     _TRANSFORMERS_IMPORT_ERROR = e
 else:
     _TRANSFORMERS_IMPORT_ERROR = None
+
+# Default HF model: RoBERTa-large CoNLL English (ORG / LOC / PER / MISC); not BERT.
+DEFAULT_HF_NER_MODEL = "Jean-Baptiste/roberta-large-ner-english"
+DEFAULT_HF_EXTRACTOR_TAG = "roberta_ner"
 
 # Zero-width / format characters to drop (length changes — handled in mapping pass).
 _ZERO_WIDTH = frozenset(
@@ -77,6 +83,19 @@ OUTPUT_FIELDS_NONRAW = [
     "window_text",
     "org_mention_count",
     "org_mentions",
+]
+
+# One row per surplus ORG mention vs the nonraw (deduped-by-text) view, or per nonraw-only anomaly.
+OUTPUT_FIELDS_ORG_DIFF = [
+    "window_id",
+    "raw_org_span_count",
+    "nonraw_unique_org_count",
+    "raw_mention",
+    "mention_start",
+    "mention_end",
+    "extractor_name",
+    "extra_source",
+    "diff_reason",
 ]
 
 
@@ -190,13 +209,13 @@ def load_spacy(model_name: str):
         ) from None
 
 
-def load_hf_ner(device: int | str = -1):
+def load_hf_ner(model_name: str = DEFAULT_HF_NER_MODEL, device: int | str = -1):
     if pipeline is None:
         raise RuntimeError(f"transformers not installed: {_TRANSFORMERS_IMPORT_ERROR}")
     # Token-classification NER; aggregation merges subwords into word/entity spans with char positions.
     return pipeline(
         "ner",
-        model="dslim/bert-base-NER",
+        model=model_name,
         aggregation_strategy="simple",
         device=device,
     )
@@ -317,6 +336,102 @@ def aggregate_mentions_by_window(
     return out_rows
 
 
+def build_org_diff_log_rows(
+    windows: list[dict[str, str]],
+    mention_rows: list[dict[str, Any]],
+    nonraw_by_window_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Compare span-level ORG harvest (all rows in mention_rows per window) to the nonraw rule
+    (first occurrence per case-insensitive mention string).
+
+    - Surplus spans (2nd+ occurrence of the same text) are logged with extra_source=raw and
+      diff_reason=duplicate_in_raw.
+    - If the aggregated nonraw string list ever contains a text not seen in any span row
+      (should not happen with a consistent pipeline), log one row per such text with
+      extra_source=nonraw and diff_reason=only_in_nonraw_aggregate.
+
+    Windows with no differences produce no rows.
+    """
+    by_wid: dict[str, list[dict[str, Any]]] = {}
+    for r in mention_rows:
+        wid = (r.get("window_id") or "").strip()
+        if not wid:
+            continue
+        by_wid.setdefault(wid, []).append(r)
+
+    out: list[dict[str, Any]] = []
+    for w_dict in windows:
+        wid = (w_dict.get("window_id") or "").strip()
+        mrows = by_wid.get(wid, [])
+        raw_total = len(mrows)
+        if raw_total == 0:
+            continue
+
+        mrows_sorted = sorted(
+            mrows,
+            key=lambda x: (
+                int(x.get("mention_start") or 0),
+                int(x.get("mention_end") or 0),
+                str(x.get("org_mention_text") or ""),
+            ),
+        )
+
+        span_texts_lower: set[str] = set()
+        for r in mrows_sorted:
+            text = str(r.get("org_mention_text") or r.get("raw_mention") or "").strip()
+            if text:
+                span_texts_lower.add(text.lower())
+
+        uniq_after = len(span_texts_lower)
+
+        seen_lower: set[str] = set()
+        for r in mrows_sorted:
+            text = str(r.get("org_mention_text") or r.get("raw_mention") or "").strip()
+            low = text.lower()
+            if not low:
+                continue
+            if low in seen_lower:
+                out.append({
+                    "window_id": wid,
+                    "raw_org_span_count": raw_total,
+                    "nonraw_unique_org_count": uniq_after,
+                    "raw_mention": text,
+                    "mention_start": r.get("mention_start", ""),
+                    "mention_end": r.get("mention_end", ""),
+                    "extractor_name": r.get("extractor_name", ""),
+                    "extra_source": "raw",
+                    "diff_reason": "duplicate_in_raw",
+                })
+            else:
+                seen_lower.add(low)
+
+        # Defensive: strings appearing in *_nonraw aggregate but not in any span row
+        nonraw_row = nonraw_by_window_id.get(wid)
+        if nonraw_row:
+            agg_parts = [
+                p.strip()
+                for p in str(nonraw_row.get("org_mentions") or "").split(" ; ")
+                if p.strip()
+            ]
+            for phrase in agg_parts:
+                low = phrase.lower()
+                if low and low not in span_texts_lower:
+                    out.append({
+                        "window_id": wid,
+                        "raw_org_span_count": raw_total,
+                        "nonraw_unique_org_count": uniq_after,
+                        "raw_mention": phrase,
+                        "mention_start": "",
+                        "mention_end": "",
+                        "extractor_name": "",
+                        "extra_source": "nonraw",
+                        "diff_reason": "only_in_nonraw_aggregate",
+                    })
+
+    return out
+
+
 def aggregate_raw_mentions_by_window(
     windows: list[dict[str, str]],
     raw_mention_rows: list[dict[str, Any]],
@@ -383,6 +498,7 @@ def process_windows(
     windows: list[dict[str, str]],
     nlp: Any,
     ner_pipe: Any,
+    hf_extractor_tag: str = DEFAULT_HF_EXTRACTOR_TAG,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for wrow in windows:
@@ -410,7 +526,7 @@ def process_windows(
             if mapped is None:
                 continue
             o0, o1 = mapped
-            span_extractors.append((o0, o1, "dslim_bert_ner", cs, ce))
+            span_extractors.append((o0, o1, hf_extractor_tag, cs, ce))
 
         merged = merge_spans_for_window(span_extractors)
 
@@ -470,10 +586,26 @@ def main() -> int:
         help="HF pipeline device: -1 CPU, 0+ GPU index",
     )
     parser.add_argument(
+        "--hf-ner-model",
+        default=DEFAULT_HF_NER_MODEL,
+        help="Hugging Face model id for token-classification NER (default: RoBERTa-large CoNLL English)",
+    )
+    parser.add_argument(
+        "--hf-extractor-tag",
+        default=DEFAULT_HF_EXTRACTOR_TAG,
+        help="Label stored in extractor_name for HF spans (e.g. roberta_ner, dslim_bert_ner)",
+    )
+    parser.add_argument(
         "--preview",
         type=int,
         default=5,
         help="Print this many sample rows from input and output CSV (0 to skip)",
+    )
+    parser.add_argument(
+        "--org-diff-log",
+        type=Path,
+        default=None,
+        help="CSV for ORG mention differences (raw vs nonraw). Default: <output stem>_org_diff.csv beside -o",
     )
     args = parser.parse_args()
 
@@ -490,12 +622,14 @@ def main() -> int:
 
     print("Loading spaCy…")
     nlp = load_spacy(args.spacy_model)
-    print("Loading Hugging Face NER (dslim/bert-base-NER)…")
-    ner_pipe = load_hf_ner(device=dev)
+    print(f"Loading Hugging Face NER ({args.hf_ner_model})…")
+    ner_pipe = load_hf_ner(model_name=args.hf_ner_model, device=dev)
 
     windows = read_windows(inp)
     print(f"Processing {len(windows)} windows from {inp}")
-    mention_rows = process_windows(windows, nlp, ner_pipe)
+    mention_rows = process_windows(
+        windows, nlp, ner_pipe, hf_extractor_tag=args.hf_extractor_tag
+    )
     raw_rows = aggregate_raw_mentions_by_window(windows, mention_rows)
     write_mentions(outp, raw_rows, fieldnames=OUTPUT_FIELDS_RAW)
     print(f"Wrote {len(raw_rows)} raw window rows to {outp}")
@@ -506,10 +640,21 @@ def main() -> int:
     write_mentions(nonraw_outp, nonraw_rows, fieldnames=OUTPUT_FIELDS_NONRAW)
     print(f"Wrote {len(nonraw_rows)} window rows to {nonraw_outp}")
 
+    nonraw_by_id = {(r.get("window_id") or "").strip(): r for r in nonraw_rows}
+    diff_path = (
+        args.org_diff_log.resolve()
+        if args.org_diff_log is not None
+        else (outp.parent / (outp.stem + "_org_diff" + outp.suffix))
+    )
+    diff_rows = build_org_diff_log_rows(windows, mention_rows, nonraw_by_id)
+    write_mentions(diff_path, diff_rows, fieldnames=OUTPUT_FIELDS_ORG_DIFF)
+    print(f"Wrote {len(diff_rows)} org-diff rows to {diff_path}")
+
     if args.preview > 0:
         print_preview("INPUT", inp, args.preview)
         print_preview("OUTPUT (raw)", outp, args.preview)
         print_preview("OUTPUT (nonraw)", nonraw_outp, args.preview)
+        print_preview("OUTPUT (org diff)", diff_path, args.preview)
 
     return 0
 

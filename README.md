@@ -363,7 +363,20 @@ Fields appear in candidate window outputs:
   - reason a contextual signal was demoted/suppressed (for example generic or non-competitor context).
 
 Fallback behavior:
-- If a competition-like heading block has no regular cue windows, ABCD may create one very low-priority fallback window from that block.
+- If a competition-like heading block has no regular cue windows, ABCD may create one v
+171 x 14
+1
+I’ll run abcdef.py with a 2000-window-ID setting, but first I’m checking how the script expects that input so I can execute it correctly and report the result.
+
+I found the script and confirmed it’s an extractor pipeline; next I’m checking the CLI arguments near the bottom so I can run it with exactly 2000 window IDs.
+
+The script has no built-in --limit, so I’ll run it on a temporary input CSV containing the first 2000 unique window_id rows, then execute abcdef.py against that file.
+
+I checked the workspace and there isn’t an existing input CSV yet, so I’m now locating the script/step that generates the required candidate-window file before I can run abcdef.py.
+
+I found a clue in sample_windows.py:8: it points to a candidate windows JSONL under the smoketest folder. I’m checking that exact location and, if present, I’ll generate a 2000-window CSV and run abcdef.py.
+
+ery low-priority fallback window from that block.
 - This preserves potentially useful competitive context without over-prioritizing it.
 
 ---
