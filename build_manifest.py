@@ -52,6 +52,9 @@ ACCESSION_RE = re.compile(r"(\d{10}-\d{2}-\d{6})")
 # Accession numbers normalised to digits-only used for CIK extraction
 CIK_FROM_ACCESSION_RE = re.compile(r"^(\d{10})")
 
+# Parse local SEC archive path style accession: .../##########-##-######.txt
+ACCESSION_FROM_PATH_RE = re.compile(r"(\d{10}-\d{2}-\d{6})")
+
 # Characters that should be treated as segment separators in the stem when
 # the double-underscore delimiter is not found.
 FALLBACK_SEP_RE = re.compile(r"_{2,}")
@@ -132,6 +135,77 @@ def _cik_from_accession(accession: str) -> tuple[Optional[str], Optional[str]]:
     return raw, str(int(raw)) # strip leading zeros for integer form
 
 
+def _extract_accession(value: str) -> Optional[str]:
+    """Extract canonical accession number from any string containing it."""
+    if not value:
+        return None
+    m = ACCESSION_FROM_PATH_RE.search(value)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _normalize_cik(value: str | None) -> Optional[str]:
+    """Normalize CIK to integer-string representation (no leading zeros)."""
+    if value is None:
+        return None
+    digits = re.sub(r"\D", "", str(value))
+    if not digits:
+        return None
+    return str(int(digits))
+
+
+def _build_issuer_cik_lookup(repo_root: Path) -> tuple[dict[str, str], set[str]]:
+    """
+    Build accession -> issuer CIK lookup from SEC metadata and raw archive paths.
+
+    Why this exists:
+      - Accession prefix CIK can be submitter/filing-agent CIK (e.g., 0001193125),
+        not the filing issuer CIK.
+      - SEC metadata and SEC raw directory structure contain the issuer CIK.
+    """
+    sec_dir = repo_root / "SEC"
+    candidates: dict[str, set[str]] = {}
+
+    def add(accession: str | None, cik: str | None) -> None:
+        if not accession or not cik:
+            return
+        candidates.setdefault(accession, set()).add(cik)
+
+    if sec_dir.is_dir():
+        for meta_csv in sorted(sec_dir.glob("*_filings_metadata.csv")):
+            try:
+                with meta_csv.open(encoding="utf-8-sig", newline="") as fh:
+                    for row in csv.DictReader(fh):
+                        accession = (
+                            _extract_accession(str(row.get("filename") or ""))
+                            or _extract_accession(str(row.get("local_path") or ""))
+                            or _extract_accession(str(row.get("url") or ""))
+                        )
+                        issuer_cik = _normalize_cik(str(row.get("cik") or ""))
+                        add(accession, issuer_cik)
+            except Exception:
+                continue
+
+        for raw_root in sorted(sec_dir.glob("*_10K_raw")):
+            if not raw_root.is_dir():
+                continue
+            for txt in raw_root.rglob("*.txt"):
+                issuer_cik = _normalize_cik(txt.parent.name)
+                accession = _extract_accession(txt.name)
+                add(accession, issuer_cik)
+
+    resolved: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for accession, cik_set in candidates.items():
+        if len(cik_set) == 1:
+            resolved[accession] = next(iter(cik_set))
+        elif len(cik_set) > 1:
+            ambiguous.add(accession)
+
+    return resolved, ambiguous
+
+
 def _clean_company_name(raw: str) -> str:
     """
     Light cleaning of the company name segment:
@@ -156,7 +230,7 @@ def parse_filename(stem: str) -> dict:
 
     Returns a dict with keys:
         filing_date, filing_year, source_company_name,
-        accession_number, cik_raw, source_cik,
+        accession_number, cik_raw, submitter_cik, source_cik,
         section_type, parse_success, parse_notes
     """
     notes: list[str] = []
@@ -166,7 +240,9 @@ def parse_filename(stem: str) -> dict:
         "source_company_name": None,
         "accession_number": None,
         "cik_raw": None,
+        "submitter_cik": None,
         "source_cik": None,
+        "source_cik_source": None,
         "section_type": None,
         "parse_success": True,
         "parse_notes": "",
@@ -207,7 +283,7 @@ def parse_filename(stem: str) -> dict:
         result["accession_number"] = accession
         cik_raw, cik_int = _cik_from_accession(accession)
         result["cik_raw"] = cik_raw
-        result["source_cik"] = cik_int
+        result["submitter_cik"] = cik_int
     else:
         notes.append(f"accession number not found in last segment '{last_segment}'")
         result["parse_success"] = False
@@ -304,7 +380,12 @@ def detect_section_presence(text: str) -> dict:
 # Core manifest builder
 # ---------------------------------------------------------------------------
 
-def build_manifest_row(path: Path, large_threshold: int) -> dict:
+def build_manifest_row(
+    path: Path,
+    large_threshold: int,
+    issuer_cik_by_accession: dict[str, str],
+    ambiguous_accessions: set[str],
+) -> dict:
     """Build one manifest row for the given .txt file."""
     stem = path.stem
     filename = path.name
@@ -346,11 +427,33 @@ def build_manifest_row(path: Path, large_threshold: int) -> dict:
             note = f"section_type from content fallback: '{fallback_st}'"
             parsed["parse_notes"] = (parsed["parse_notes"] + "; " + note).lstrip("; ")
 
+    # ── Resolve canonical issuer CIK from SEC metadata/raw lookups ───────────
+    # Accession-prefix CIK can represent a submitter agent; do not treat it as issuer.
+    accession = parsed.get("accession_number")
+    submitter_cik = parsed.get("submitter_cik")
+    if accession and accession in issuer_cik_by_accession:
+        parsed["source_cik"] = issuer_cik_by_accession[accession]
+        parsed["source_cik_source"] = "sec_issuer_lookup"
+    elif accession and accession in ambiguous_accessions:
+        parsed["source_cik"] = None
+        parsed["source_cik_source"] = "unresolved_ambiguous_accession"
+        note = "issuer CIK unresolved: accession maps to multiple issuer CIKs in SEC sources"
+        parsed["parse_notes"] = (parsed["parse_notes"] + "; " + note).lstrip("; ")
+        parsed["parse_success"] = False
+    elif submitter_cik:
+        parsed["source_cik"] = None
+        parsed["source_cik_source"] = "unresolved_submitter_only"
+        note = "issuer CIK unresolved: only submitter/accession-prefix CIK available"
+        parsed["parse_notes"] = (parsed["parse_notes"] + "; " + note).lstrip("; ")
+        parsed["parse_success"] = False
+
     # ── Assemble row (ordered for readability) ───────────────────────────────
     return {
         # Essential fields
         "source_company_name": parsed["source_company_name"],
         "source_cik":          parsed["source_cik"],
+        "submitter_cik":       parsed["submitter_cik"],
+        "source_cik_source":   parsed["source_cik_source"],
         "filing_year":         parsed["filing_year"],
         "filing_date":         parsed["filing_date"],
         "accession_number":    parsed["accession_number"],
@@ -379,6 +482,8 @@ def build_manifest_row(path: Path, large_threshold: int) -> dict:
 ESSENTIAL_FIELDS = [
     "source_company_name",
     "source_cik",
+    "submitter_cik",
+    "source_cik_source",
     "filing_year",
     "filing_date",
     "accession_number",
@@ -548,6 +653,9 @@ def main() -> None:
     if output_base:
         output_base.mkdir(parents=True, exist_ok=True)
 
+    repo_root = Path(__file__).resolve().parent
+    issuer_cik_by_accession, ambiguous_accessions = _build_issuer_cik_lookup(repo_root)
+
     if args.use_all_files and args.sample_size is not None:
         print("[build_manifest] --use-all-files set; ignoring --sample-size.")
     if args.sample_size is not None and args.sample_size <= 0:
@@ -590,7 +698,12 @@ def main() -> None:
             else txt_files
         )
         for path in row_iter:
-            row = build_manifest_row(path, large_threshold=args.large_threshold)
+            row = build_manifest_row(
+                path,
+                large_threshold=args.large_threshold,
+                issuer_cik_by_accession=issuer_cik_by_accession,
+                ambiguous_accessions=ambiguous_accessions,
+            )
             rows.append(row)
 
         # ── Choose output dir per input/year folder ────────────────────────

@@ -36,6 +36,7 @@ OUTPUT_FIELDS = [
     "window_id",
     "source_company",
     "source_cik",
+    "submitter_cik",
     "filing_year",
     "accession_number",
     "filing_id",
@@ -105,6 +106,7 @@ def normalize_row(raw: dict[str, Any]) -> dict[str, str]:
     return {
         "source_company": str(company).strip(),
         "source_cik": str(raw.get("source_cik") or "").strip(),
+        "submitter_cik": str(raw.get("submitter_cik") or "").strip(),
         "filing_year": str(raw.get("filing_year") or "").strip(),
         "accession_number": str(acc).strip(),
         "filing_id": str(fid).strip(),

@@ -9,19 +9,60 @@ The work sits at the intersection of **information extraction** and **corporate 
 ## Table of contents
 
 1. [Problem and goals](#problem-and-goals)
-2. [High-level pipeline](#high-level-pipeline)
-3. [Why these design choices](#why-these-design-choices)
-4. [Script and module index](#script-and-module-index)
-5. [Stage 1: Cleaning, section extraction, and routing](#stage-1-cleaning-section-extraction-and-routing)
-6. [Stage 2: Manifest](#stage-2-manifest)
-7. [Stage 3: Candidate windows (ABCD)](#stage-3-candidate-windows-abcd)
-8. [Stage 4: Explicit windows](#stage-4-explicit-windows)
-9. [Stage 5: Organization mentions (NER)](#stage-5-organization-mentions-ner)
-10. [Mention quality: prefilter and dropset](#mention-quality-prefilter-and-dropset)
-11. [Dependencies](#dependencies)
-12. [Challenges faced throughout the project](#challenges-faced-throughout-the-project)
-13. [Open challenges and limitations](#open-challenges-and-limitations)
-14. [Reference: folders, routing, audits, thresholds](#reference-folders-routing-audits-thresholds)
+   - [Temporal motivation: 2023 vs 2024](#temporal-motivation-2023-vs-2024)
+2. [Glossary](#glossary)
+3. [High-level pipeline](#high-level-pipeline)
+4. [MLOps overview (reference diagram)](#mlops-overview-reference-diagram)
+5. [Why these design choices](#why-these-design-choices)
+6. [Script and module index](#script-and-module-index)
+7. [Stage 1: Cleaning, section extraction, and routing](#stage-1-cleaning-section-extraction-and-routing)
+8. [Stage 2: Manifest](#stage-2-manifest)
+9. [Company node list](#company-node-list--build_company_nodespy)
+10. [Stage 3: Candidate windows (ABCD)](#stage-3-candidate-windows-abcd)
+11. [Stage 4: Explicit windows](#stage-4-explicit-windows)
+12. [Stage 5: Organization mentions (NER)](#stage-5-organization-mentions-ner)
+13. [Mention quality: prefilter and dropset](#mention-quality-prefilter-and-dropset)
+14. [Dependencies](#dependencies)
+15. [Challenges faced throughout the project](#challenges-faced-throughout-the-project)
+16. [Open challenges and limitations](#open-challenges-and-limitations)
+17. [Work on when have time](#work-on-when-have-time)
+18. [Reference: folders, routing, audits, thresholds](#reference-folders-routing-audits-thresholds)
+
+---
+
+## Glossary
+
+| Term | Definition |
+|------|------------|
+| **10-K** | U.S. public companies’ **annual report** to the SEC; includes Item 1 (Business) and often a competition discussion. This pipeline ingests the primary HTML/text document. |
+| **SEC** | **Securities and Exchange Commission**; receives filings and assigns identifiers (e.g. CIK, accession numbers). |
+| **CIK** | **Central Index Key** — the SEC’s stable **numeric identifier** for a filing entity (issuer). In this repo, CIK is parsed from filenames/accessions (`source_cik`, `cik_raw`); **mention strings** are not automatically linked to CIKs. |
+| **Accession number** | SEC **filing-level ID** (format `##########-##-######`), unique per submission; appears in extracted filenames and CSV join keys. |
+| **Filer / source company** | The company that **filed** the 10-K (the “ego” firm in a competition graph). Often `source_company` / `source_company_name` in CSVs. |
+| **Item 1 (Business)** | Standard 10-K section describing the business; primary source for **business** / **competition** text extracts here. |
+| **XBRL** | **eXtensible Business Reporting Language** — structured tagging often embedded in SEC HTML; treated as noise for **plain-text** extraction in this project. |
+| **Manifest** | Per-year **inventory** of extracted `*_business.txt` files (paths, CIK, dates, sizes) built by `build_manifest.py`; join key for later stages. |
+| **Company node list** | Optional filer/node export (`build_company_nodes.py`): one row per parsed `*_business.txt` file with company name, CIK, ticker, and GICS-style sector (via Yahoo/yfinance)—for graph or modeling prep, not windowing. |
+| **ABCD** | **Candidate-window stage**: cue-based **sentence windows** around competitive language (`abcd.py` / related scripts), before the explicit-only filter. |
+| **Candidate window** | A **short span of sentences** around a matched **cue phrase**, exported for audit or NER. |
+| **Cue phrase / cue group** | The **matched pattern** (and its **tier**: strict, contextual, implicit, etc.) that triggered a window. |
+| **Strict explicit** | Highest-priority cue tier: language that **directly** signals competitors (e.g. “our competitors include …”). |
+| **Contextual explicit** | Cues that often co-occur with rivals but are **less list-like** than strict (e.g. “highly competitive”). |
+| **Explicit windows** | Rows kept after filtering to **strict + contextual explicit** only → `explicit_candidate_windows.csv` for NER. |
+| **`window_id`** | Stable ID for one **explicit** window (e.g. `EXPW…`), used to tie mentions back to text. |
+| **NER** | **Named entity recognition** — models that tag spans (e.g. `ORG`) in text; here **spaCy** + a **Hugging Face** token-classification model, merged for recall. |
+| **ORG / MISC** | NER **labels**: **organization** vs **miscellaneous** (HF’s `MISC` often catches company-like phrases not tagged `ORG`). |
+| **Mention** | A **text span** tagged as a company-like string (not yet a resolved **entity**). |
+| **Entity linking** | Mapping a **string** (e.g. “Alphabet Inc.”) to a canonical ID (usually **CIK**). **Out of scope** in-repo; needed for clean graph nodes/edges on the **target** side. |
+| **Union mentions** | **Merged** mention list from both extractors (`org_mentions_union`, etc.) before or after prefilter columns. |
+| **`org_mentions_union_filtered`** | **Post-prefilter** mention string list (semicolon-joined) — company candidates after junk rules. |
+| **Prefilter** | `org_mention_prefilter` policy: **keep** / **drop** / **review** per mention string (plus optional self-filer suppression). |
+| **Dropset** | **Data-only** lists/regexes in `org_mention_junk_dropset` that drive obvious-junk removal; versioned with `DROPSPEC_VERSION`. |
+| **`pipeline_role`** | Optional **`gemini_mention_label.py`** output: coarse routing label (e.g. explicit company candidate vs product brand vs ignore). |
+| **`no_outgoing_edges`** | Routing **folder** for filers whose business text has **no** competition section/header and **no** competition terms → **no** competitor edges in a disclosure graph; filer may still be a **node**. |
+| **Isolated** | Filings that failed **section extraction** thresholds or routing; land under `{year}_10K_isolated/` subfolders. |
+| **Warm-start / cold-start (node)** | **Warm-start**: node seen in **earlier time slices** (e.g. 2023 and 2024). **Cold-start**: little/no history; **cold-but-observable** can appear first in the latest pre-target year (e.g. 2024 only). |
+| **Leakage (temporal)** | Using **future** information when training or evaluating a **past→future** model (e.g. 2025 labels in features for a 2024 snapshot); avoided via **time-aware splits**. |
 
 ---
 
@@ -46,6 +87,25 @@ The work sits at the intersection of **information extraction** and **corporate 
 - End-to-end **CIK resolution** or ticker linking for every extracted string.
 - Training a custom competition classifier on labeled data (the pipeline is mostly **rules + off-the-shelf NER**).
 - Full **implicit competition** (e.g. strategic substitutes named without “competitor” language)—some hooks exist (`implicit_or_broad`, `future_profile_hint`) but they are not the primary deliverable.
+
+### Temporal motivation: 2023 vs 2024
+
+The pipeline is run on **multiple filing years** on purpose: **2023 and 2024 play different roles** in a temporal learning setup aimed at forecasting a **next** competitive state (e.g. **2025**), not at memorizing a single frozen graph.
+
+- **2024** is the **freshest pre-target-year signal**: it encodes what the competitive landscape looked like **immediately before** the year you want to predict.
+- **2023** is an **earlier snapshot** so a model can learn **change over time** instead of seeing only one year. The task is naturally framed as **given past states, predict the next state**, not **who looks competitive in the latest slice alone**.
+
+That framing aligns with standard concerns in **link prediction**: results depend heavily on **how data are prepared and split**, and **leakage** must be avoided—goals that a **strict temporal** train/validation design supports.
+
+Using **both** years helps separate **persistence**, **emergence**, and **weakening** of evidence:
+
+- An edge or signal in **both** years supports **persistence** into the target year.
+- Evidence **only in 2024** can indicate a **newly emerging** rivalry relative to 2023.
+- **Strengthening** implicit or explicit signals from 2023 → 2024 is informative when predicting **weights** or intensity. With **2024 alone**, you lose **trend** information; with **2023 alone**, inputs are **older** and less aligned with the pre-target regime.
+
+**Coverage and cold start.** Some firms behave as **warm-start** nodes (history in both years). Others may **first appear in 2024**; they remain **valid pre-target observations** and can be treated as **cold-start but observable** in that window. Firms with **no** 2023–2024 evidence should generally **not** anchor the main **target-year benchmark**.
+
+**Methodological takeaway.** The research question is not only *who looks competitive in 2024?* but *how did the graph and textual evidence **move from 2023 to 2024**, and what does that imply for **2025**?* A **2024-only** design can still work but skews toward **one-step snapshot** prediction; **2023 + 2024** supports a **history-aware forecast**, which is typically stronger for **directed** edges, **weighted** relations, and **reviewer-facing** rigor.
 
 ---
 
@@ -91,6 +151,38 @@ flowchart LR
 
 If you want steps 7+8 in one command, use **`run_prefilter_pipeline.py`**.
 
+### MLOps overview (reference diagram)
+
+Use this for **thesis chapters, proposals, or slides**: a generic **MLOps lifecycle** (data → versioning → feature pipeline → train → evaluate → registry → serve → monitor, plus a **feedback / retrain** loop). The rendered figure is **`mlops_lifecycle_diagram.png`** in the repo root.
+
+![MLOps lifecycle overview](mlops_lifecycle_diagram.png)
+
+**Editable diagram (Mermaid)** — swap in your tooling names (e.g. DVC, MLflow, W&B, cloud storage, batch jobs):
+
+```mermaid
+flowchart LR
+  subgraph data [Data]
+    SRC[Raw sources]
+    VER[Versioning / catalog]
+  end
+  subgraph build [Features]
+    PIPE[ETL and extraction pipeline]
+  end
+  subgraph train [Model]
+    EXP[Training / experiments]
+    MET[Evaluation and tests]
+    REG[Model registry]
+  end
+  subgraph live [Operations]
+    SRV[Serving or batch inference]
+    MON[Monitoring / drift / quality]
+  end
+  SRC --> VER --> PIPE --> EXP --> MET --> REG --> SRV --> MON
+  MON -.->|retrain, fix data, new labels| VER
+```
+
+**Map to this repository.** SEC inputs and derived CSVs ≈ **sources**; scripts from cleaning through NER, prefilter, and optional **`gemini_mention_label.py`** ≈ **feature pipeline**; future graph construction and GNN / link-prediction runs ≈ **experiments**; use **time-aware splits** and **leakage checks** under **evaluation**; pin environments, seeds, and artifact versions for **reproducibility** (registry and CI/CD are optional layers on top).
+
 ---
 
 ## Why these design choices
@@ -116,6 +208,7 @@ If you want steps 7+8 in one command, use **`run_prefilter_pipeline.py`**.
 | **`restore_2023_outputs.py`** | **2023** reprocessing from `SEC/2023_10K_raw` with local `OUTPUT_DIRS`—useful when normalizing folder layout. |
 | **`append_competition_to_business.py`** / **`ab.py`** | When cleaned filings contain **both** business and competition sections, **append** competition text to the paired business extract so cueing sees full context. |
 | **`build_manifest.py`** | Filename + size manifest over `*_10K_business`; no NLP. |
+| **`build_company_nodes.py`** | **Optional:** union of `*_business.txt` under `{year}_10k_business` / `{year}_10K_business` and `{year}_no_outgoing_edges` → **`{year}_company_nodes.csv`** (one row per parsed `*_business.txt`: name, CIK, ticker, GICS sector). See [§ Company node list](#company-node-list--build_company_nodespy). |
 | **`abcd.py`** | **Primary** ABCD step: manifest → **`candidate_windows.csv`**, **`candidate_windows.jsonl`**, **`window_audit_summary.txt`**. Includes heading fallback and tqdm. |
 | **`build_candidate_windows.py`** | Same conceptual step as `abcd.py`; **variant** (e.g. cue/fallback differences—use one consistently per study). |
 | **`build_explicit_candidate_windows.py`** / **`abcde.py`** | Filter to **strict + contextual explicit** rows; dedupe; assign **`window_id`** → **`explicit_candidate_windows.csv`**. |
@@ -146,6 +239,8 @@ The full routing table and folder semantics are in [Reference](#reference-folder
 ## Stage 2: Manifest
 
 See **`build_manifest.py`** in the [reference section](#manifest-builder--build_manifestpy) below. The manifest is the join key between **filing identity** (date, accession, company name, CIK from filename) and **on-disk text paths** for ABCD.
+
+For a filer/node export table (rows sourced from parsed `*_business.txt` files with ticker + industry fields for graphs or modeling), see [`build_company_nodes.py`](#company-node-list--build_company_nodespy) in the reference section below.
 
 ---
 
@@ -217,6 +312,8 @@ python abcdef.py -i windows_with_union.csv -o ORG_out_raw.csv
 python abcdef.py -i windows.csv -o ORG_out_raw.csv --ner-text-column window_text
 ```
 
+**Known issue (Python 3.14+):** In this repo's current dependency set, spaCy import can fail on Python 3.14 with a Pydantic v1 compatibility error (for example: `unable to infer type for attribute "REGEX"`). When this happens, `abcdef.py` prints a warning and continues in Hugging Face-only mode. For dual-extractor output (spaCy + HF), run this stage in a Python 3.11 or 3.12 environment.
+
 ### `extract_explicit_mentions_raw.py` (mention-per-row)
 
 Same models and normalization, but output is **one row per mention span** (`raw_mention`, `mention_start`, `mention_end`, …). No bundled nonraw/org-diff artifacts—use when you only need a flat mention list. **`--ner-text-column auto`** (default): use **`org_mentions_union_filtered`** when that column exists (NER only sees the prefilter-approved mention list string); otherwise **`window_text`**. Output includes **`ner_input_text`** (the string NER saw); **`window_text`** remains the full window.
@@ -248,6 +345,17 @@ python build_union_prefilter_output.py \
   -o ORG_detection/union_filtered_prefilter_output.csv
 ```
 
+**Recent run report (2026-03-20):**
+
+- 2023 input: `2023/explicit_mentions_raw_2023_abcd_v1_nonraw.csv`
+- 2023 output: `2023/union_filtered_prefilter_output_2023_abcd_v1.csv`
+- 2023 rows processed: `5222`
+- 2023 mentions total / kept / dropped / review: `16540 / 14809 / 1472 / 259`
+- 2024 input: `2024/explicit_mentions_raw_2024_abcd_v1_nonraw.csv`
+- 2024 output: `2024/union_filtered_prefilter_output_2024_abcd_v1.csv`
+- 2024 rows processed: `4816`
+- 2024 mentions total / kept / dropped / review: `15518 / 13958 / 1293 / 267`
+
 ### Cleaned prefilter output (post-filter export)
 
 `clean_prefilter_columns.py` writes a compact file (default suffix: `_cleaned`) intended for downstream review/modeling without verbose prefilter audit fields.
@@ -261,6 +369,21 @@ python build_union_prefilter_output.py \
 python clean_prefilter_columns.py \
   ORG_detection/union_filtered_prefilter_output.csv
 ```
+
+**Recent clean run report (2026-03-20):**
+
+- Process used:
+  - `python clean_prefilter_columns.py 2023/union_filtered_prefilter_output_2023_abcd_v1.csv`
+  - `python clean_prefilter_columns.py 2024/union_filtered_prefilter_output_2024_abcd_v1.csv`
+- 2023 input: `2023/union_filtered_prefilter_output_2023_abcd_v1.csv`
+- 2023 output: `2023/union_filtered_prefilter_output_2023_abcd_v1_cleaned.csv`
+- 2023 rows: `5222`
+- 2023 columns (original / removed / final): `25 / 11 / 13`
+- 2024 input: `2024/union_filtered_prefilter_output_2024_abcd_v1.csv`
+- 2024 output: `2024/union_filtered_prefilter_output_2024_abcd_v1_cleaned.csv`
+- 2024 rows: `4816`
+- 2024 columns (original / removed / final): `25 / 11 / 13`
+- Validation note: `KeyStar Corp.` and `VIP Play, Inc.` both map to CIK `1832161`; this is a legitimate same-issuer rename/alias case, not a CIK mismatch.
 
 ### One-command prefilter runner
 
@@ -381,6 +504,7 @@ Audit with self-suppression: `python org_mention_prefilter.py windows.csv --sour
 - **ABCD:** standard library + optional **`tqdm`**.
 - **NER:** `requirements-explicit-mentions.txt` — `spacy`, `transformers`, `torch`.
 - **Gemini mention labeling (optional):** `google-generativeai`; set **`GEMINI_API_KEY`** (see [§ Gemini mention labeling](#gemini-mention-labeling)).
+- **Company node CSV (optional):** `requirements-build-company-nodes.txt` — `yfinance`, `tqdm` for [`build_company_nodes.py`](#company-node-list--build_company_nodespy).
 
 ---
 
@@ -391,6 +515,12 @@ This section records **practical problems encountered while building** the pipel
 **Ingestion and structure.** Real 10-K HTML rarely matches a single template. **Section boundaries** drift (Item 1 titles, embedded TOCs, multi-column layouts), so extraction is **brittle** and some filings land in **isolated** buckets or weak **business** cuts. **Routing** (`no_outgoing_edges`, competition-only heuristics) is a judgment call: false negatives and false positives trade off.
 
 **Configuration and portability.** Early scripts (`a.py`, `script.py`) embed **machine-specific paths**; **`restore_2023_outputs.py`** and other tools assume a particular **`SEC/`** layout. Moving between machines or years requires **manual path edits**—a recurring friction point.
+
+**CIK truth-source mismatch (issuer vs submitter).** A major data-quality bug appeared in local SEC trees: many filenames encoded the accession-prefix CIK (submitter/agent CIK, often `0000950170`-style) while the folder CIK under `SEC/{year}_10K_raw/<cik>/` represented the issuer. This produced false equality in downstream outputs (different companies sharing the same CIK). Example observed in node CSVs: Cytta and Guskin initially shared one submitter CIK even though issuer CIKs differ.
+
+**Solution applied locally.** We standardized on **SEC raw issuer folder CIK as the canonical source of truth** and used accession-prefix CIK only as fallback when issuer evidence is unavailable. The fix was implemented as a workspace migration: (1) rename mismatched `SEC/*_10K_raw` txt stems so accession CIK matches issuer folder CIK, (2) propagate those stem renames to mirrored txt copies (`*_10K_cleaned`, `*_10K_business`, etc.), and (3) update CIK columns in affected CSV outputs where source mapping was available. We also patched `build_company_nodes.py` to prefer issuer-CIK lookup from SEC raw tree before accession-prefix fallback, so future regenerations preserve issuer identity.
+
+**Operational caveat.** A small number of rename collisions can occur when two old stems converge to the same corrected stem. Those are left for deterministic manual handling instead of destructive overwrite.
 
 **Cueing and windows.** Cue phrases are **English-centric** and tuned on recurring disclosure phrasing. **Strict** cues miss rare wording; **broad** tiers pull in boilerplate. **Overlap dedup** saves annotation cost but can **merge** distinct evidence in edge cases. **Heading fallback** helps recall but is not a complete fix.
 
@@ -450,7 +580,7 @@ Contains `_business.txt` files with the extracted section text.
 - No competition section header was found (e.g. `Item 1 – Competition`)
 - No competition terms (`competition`, `competitor`, `competitive`, `compete`, etc.) appear in the extracted business section
 
-These filings mention no competitors in their business section, so they have no outgoing edges in a competition graph.
+These filings mention no competitors in their business section, so they have no outgoing edges in a competition graph. However, they will still be considered as nodes since we were still able to collect discriptions of the company.
 
 ---
 
@@ -675,6 +805,174 @@ manifest folders, for example `2023_manifest/` and `2024_manifest/`.
 
 ---
 
+## Company node list — `build_company_nodes.py`
+
+### Purpose
+
+`build_company_nodes.py` builds a node CSV from the **union** of all `*_business.txt` files under:
+
+- `{year}_10k_business` or `{year}_10K_business`, and
+- `{year}_no_outgoing_edges`
+
+under `--base-dir` (defaults to the current directory). Filenames use the same convention as the manifest ([§ Expected filename format](#expected-filename-format)).
+
+Current behavior: **no CIK deduplication**. The output keeps one row per parsed
+`*_business.txt` path, so the same CIK can appear in multiple rows when there
+are multiple filings.
+
+This step is **optional** for the windowing pipeline; it is meant for **graph / features** (nodes keyed by CIK) rather than per-filing manifests.
+
+### Role in this repo
+
+`build_company_nodes.py` is the bridge between filing-level text outputs and
+graph-level modeling inputs:
+
+- It converts many filing text files into an organized node export with
+  `company_name`, `cik`, `ticker`, and `gics_sector`.
+- It includes issuers from both business extracts and `no_outgoing_edges`, so
+  graph node coverage is not limited to filings that produced candidate windows.
+- It is designed for node attributes and coverage checks, while `abcd.py` and
+  downstream scripts remain responsible for window extraction and mention-level
+  evidence.
+
+### Latest run summary (2023)
+
+Run commands used in this workspace:
+
+```bash
+python build_company_nodes.py --year 2023 --base-dir 2023
+```
+
+Observed outputs:
+
+| Year | Output file | Node rows written | Unique CIKs in rows | Ticker filled | GICS filled |
+|------|-------------|------------------:|--------------------:|--------------:|------------:|
+| 2023 | `2023/2023_company_nodes.csv` | 6,352 | 2,319 | 4,993 | 625 |
+
+Notes from the run logs:
+
+- Progress bars are enabled (`tqdm`) for parsing, row building, ticker fill, and sector fill.
+- Tickers are fetched from yfinance search by company name (not SEC ticker map).
+- A portion of rows still have empty or noisy `gics_sector` values because ticker quality is mixed.
+
+### Chronological count change (raw SEC downloads -> final cleaned company nodes)
+
+The counts below track the same pipeline chronologically from raw SEC downloads to final cleaned node rows.
+
+| Stage | 2023 | 2024 | Total | Delta vs previous stage |
+|------|-----:|-----:|------:|------------------------:|
+| Raw SEC downloads (`SEC/{year}_10K_raw/*.txt`) | 7,358 | 6,635 | 13,993 | - |
+| Routed into `10K_business U no_outgoing_edges` | 6,352 | 5,651 | 12,003 | -1,990 |
+| Final cleaned company nodes (after removing trust/fund/NASDAQ categories) | 6,107 | 5,418 | 11,525 | -478 |
+
+Net change from raw SEC downloads to final cleaned nodes:
+
+- **2023:** 7,358 -> 6,107 (**-1,251**)
+- **2024:** 6,635 -> 5,418 (**-1,217**)
+- **Total:** 13,993 -> 11,525 (**-2,468**)
+
+### Sample window (for downstream context)
+
+`build_company_nodes.py` itself does not emit text windows, but this is a
+representative strict-explicit window from the same 2024 pipeline outputs:
+
+- Source file: `2024/2024_abcd_v1/candidate_windows_strict_explicit.csv`
+- `window_id`: `W0047242`
+- `source_company_name`: `1 800 Flowers Com Inc`
+- `source_cik`: `1084869`
+- `filing_date`: `2024-09-06`
+- `cue_group` / `cue_tier`: `strict_explicit` / `4`
+- `future_profile_hint`: `competition_market`
+- `window_text`:
+
+> In the floral industry, there are various providers of floral products, none
+> of which is dominant in the industry. The Company's competitors include: ...
+
+### Output files
+
+| File | Description |
+|------|-------------|
+| `{year}_company_nodes.csv` | Default path: `{base-dir}/{year}_company_nodes.csv` |
+| `{year}_company_nodes.parse_issues.txt` | Only if some `*_business.txt` files could not be parsed for CIK + company name |
+
+### Columns
+
+| Column | Description |
+|--------|-------------|
+| `company_name` | Middle segment from the filename parse (same logic as `build_manifest.py`) |
+| `cik` | CIK as an integer string (no leading zeros) |
+| `ticker` | Candidate symbol from yfinance company-name search |
+| `gics_sector` | Yahoo Finance **sector** string via **yfinance** when ticker resolution is valid |
+
+### How ticker and GICS are filled (free sources)
+
+| Field | Source |
+|-------|--------|
+| **Ticker** | **`yfinance.Search(company_name)`** with lightweight scoring over quote type and name-token overlap. |
+| **GICS sector** | **`yfinance`** → Yahoo **`Ticker(ticker).info["sector"]`**. |
+
+**Caveats.** Ticker resolution by free-text company-name search can pick wrong symbols (for example foreign listings, warrants, stale symbols, or unrelated instruments). As a result, `gics_sector` quality depends on ticker quality.
+
+### Dependencies
+
+Install:
+
+```bash
+pip install -r requirements-build-company-nodes.txt
+```
+
+Includes **`certifi`** (recommended for HTTPS to `sec.gov` / Yahoo on some systems) and **`yfinance`**.
+Includes **`yfinance`** and **`tqdm`**.
+
+### Usage
+
+```bash
+python build_company_nodes.py --year 2024
+
+# Layout: {base-dir}/{year}_10k_business and {year}_no_outgoing_edges
+python build_company_nodes.py --year 2024 --base-dir /path/to/extracts
+
+# Optional CIK-keyed overrides (ticker, gics_*)
+python build_company_nodes.py --year 2024 --enrichment ./my_industry_overrides.csv
+
+python build_company_nodes.py --year 2024 --no-fetch-tickers
+python build_company_nodes.py --year 2024 --no-fetch-classifications
+
+# Scan nested folders for *_business.txt
+python build_company_nodes.py --year 2024 --recursive
+```
+
+### Notable flags
+
+| Flag | Meaning |
+|------|---------|
+| `--output` / `-o` | Output CSV path |
+| `--fetch-tickers` / `--no-fetch-tickers` | Resolve ticker from yfinance search (default: on) |
+| `--fetch-classifications` / `--no-fetch-classifications` | Fill GICS sector from yfinance by ticker (default: on) |
+| `--yfinance-sleep` | Seconds to sleep between yfinance requests |
+
+### Quality note (important)
+
+Ticker and GICS quality is currently mixed in the generated 2023 output because
+name-based yfinance search can return non-primary exchanges, stale symbols,
+warrants/rights, or unrelated instruments for some entities. Treat ticker/GICS
+as a draft enrichment field unless validated.
+
+---
+
+## Work on when have time
+
+- Improve ticker resolver quality:
+  - prefer primary U.S. listings where applicable
+  - down-rank warrant/right/fund/OTC symbols unless explicitly intended
+  - add stricter matching using CIK/name aliases where available
+- Add a confidence score and `ticker_source`/`ticker_quality` columns so weak
+  matches are easy to filter.
+- Build a small manual override map for high-impact mislabels observed in
+  `2023/2023_company_nodes.csv`.
+- Re-run 2024 after the improved resolver and compare ticker/GICS stability
+  against 2023.
+
 ## ABCD Candidate Windows — `abcd.py`
 
 ### What this step does
@@ -693,6 +991,63 @@ and one audit report:
 - `window_audit_summary.txt`
 
 The script uses a tqdm progress bar during file scanning.
+
+### How the three ABCD bucket files are created
+
+ABCD first detects cue phrases sentence-by-sentence, then computes a short window around each trigger, deduplicates overlapping windows, and finally routes each window into one of three export buckets.
+
+Routing rule:
+
+- `strict_explicit` cue group -> `candidate_windows_strict_explicit.*`
+- `contextual_explicit` cue group -> `candidate_windows_contextual_explicit.*`
+- all other cue groups (`implicit_or_broad`, `heading_fallback_broad`) -> `candidate_windows_broad_or_implicit.*`
+
+Core implementation points in `abcd.py`:
+
+- Cue groups and pattern lists: `STRICT_EXPLICIT_PATTERNS`, `CONTEXTUAL_EXPLICIT_PATTERNS`, `IMPLICIT_OR_BROAD_PATTERNS`
+- Matching order and cue extraction (`cue_text` from regex match): `find_cue(...)`
+- Window expansion by cue type/heading context: `compute_window(...)`
+- Overlap-aware dedup: `deduplicate_windows(...)`
+- Bucket mapping: `export_bucket_for_cue_group(...)`
+- Per-bucket file writing: `_write_bucket_files(...)`
+
+### Cue phrases observed in each 2024 bucket output
+
+From the current 2024 run outputs in `2024/2024_abcd_v1/`, the most frequent `cue_text` values were:
+
+#### `candidate_windows_strict_explicit.csv`
+
+- We compete with
+- competitors include
+- face competition from
+- compete against
+- We face competition from
+- primary competitors
+- significant competitors
+- principal competitors
+
+#### `candidate_windows_contextual_explicit.csv`
+
+- compete
+- competitors
+- our competitors
+- highly competitive
+- market share
+- Competition from
+- competitor
+- Competition in the
+
+#### `candidate_windows_broad_or_implicit.csv`
+
+- competitive advantage
+- distribution channel
+- competitive position
+- distribution network
+- barriers to entry
+- Competition
+- installed base
+
+Related aggregate counts for the same run are also captured in `window_audit_summary.txt` (`By cue_group`, `Top 20 cue phrases`).
 
 ### How to read `window_audit_summary.txt`
 

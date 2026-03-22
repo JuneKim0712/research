@@ -93,6 +93,8 @@ CONTEXTUAL_EXPLICIT_PATTERNS: list[str] = [
     r"competition\s+from",
     r"main\s+competitiors",
     r"our\s+competitors",
+    r"competition\s+in\s+the",
+    r"the\s+competition\s+in\s+the",
     r"highly\s+competitive",
     r"intensely\s+competitive",
     r"intense\s+competition",
@@ -108,7 +110,6 @@ CONTEXTUAL_EXPLICIT_PATTERNS: list[str] = [
 ]
 
 IMPLICIT_OR_BROAD_PATTERNS: list[str] = [
-    r"\becosystem\b",
     r"installed\s+base",
     r"technical\s+resources?",
     r"marketing\s+resources?",
@@ -535,16 +536,26 @@ def _parse_filename_metadata(filename: str, source_path: str = "") -> dict[str, 
         "accession_number": "",
         "filing_year": "",
         "source_cik": "",
+        "submitter_cik": "",
     }
     if m:
         out["filing_date"] = m.group(1)
         out["source_company_name"] = m.group(2).strip()
         out["accession_number"] = m.group(3).strip()
         out["filing_year"] = m.group(1)[:4]
+    acc_match = re.search(r"(\d{10})-\d{2}-\d{6}", out["accession_number"])
+    if acc_match:
+        out["submitter_cik"] = str(int(acc_match.group(1)))
+
+    # Conservative fallback only when path clearly encodes issuer CIK directory,
+    # e.g. .../SEC/2024_10K_raw/<issuer_cik>/<file>.txt
     if source_path:
-        for part in Path(source_path).parts:
-            if part.isdigit() and 4 <= len(part) <= 10:
-                out["source_cik"] = part
+        path_parts = Path(source_path).parts
+        for idx, part in enumerate(path_parts[:-1]):
+            if part.endswith("_10K_raw") and idx + 1 < len(path_parts):
+                cik_candidate = path_parts[idx + 1]
+                if cik_candidate.isdigit():
+                    out["source_cik"] = str(int(cik_candidate))
                 break
     return out
 
@@ -573,7 +584,14 @@ def normalize_manifest_row(row: dict[str, Any], base_dir: Path) -> dict[str, Any
 
     source_path_str = str(row.get("source_file") or row.get("source_path") or "")
     meta = _parse_filename_metadata(path.name, source_path_str)
-    for key in ("source_company_name", "source_cik", "filing_year", "filing_date", "accession_number"):
+    for key in (
+        "source_company_name",
+        "source_cik",
+        "submitter_cik",
+        "filing_year",
+        "filing_date",
+        "accession_number",
+    ):
         val = str(row.get(key) or "").strip()
         if val:
             meta[key] = val
@@ -584,6 +602,7 @@ def normalize_manifest_row(row: dict[str, Any], base_dir: Path) -> dict[str, Any
         "source_filename": path.name,
         "source_company_name": meta["source_company_name"],
         "source_cik": meta["source_cik"],
+        "submitter_cik": meta["submitter_cik"],
         "filing_year": meta["filing_year"],
         "filing_date": meta["filing_date"],
         "accession_number": meta["accession_number"],
@@ -765,6 +784,7 @@ def process_file(entry: dict[str, Any], window_id_start: int) -> tuple[list[dict
             "window_id": wid,
             "source_company_name": entry["source_company_name"],
             "source_cik": entry["source_cik"],
+            "submitter_cik": entry.get("submitter_cik", ""),
             "filing_year": entry["filing_year"],
             "filing_date": entry["filing_date"],
             "accession_number": entry["accession_number"],
@@ -800,6 +820,7 @@ OUTPUT_FIELDS = [
     "window_id",
     "source_company_name",
     "source_cik",
+    "submitter_cik",
     "filing_year",
     "filing_date",
     "accession_number",

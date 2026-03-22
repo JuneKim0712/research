@@ -45,10 +45,17 @@ DEFAULT_COUNT_CANDIDATES = (
     "org_mentions_raw_count",
 )
 
+DEFAULT_MENTION_TYPE_CANDIDATES = (
+    "mention_types",
+    "mention_types_raw",
+)
+
 OUTPUT_APPEND_COLUMNS = [
     "org_mentions_union_count",
     "org_mentions_union",
+    "mention_types_union",
     "org_mentions_union_filtered",
+    "mention_types_union_filtered",
     "prefilter_input_column",
     "prefilter_total_mentions",
     "prefilter_keep_count",
@@ -60,6 +67,9 @@ OUTPUT_APPEND_COLUMNS = [
     "prefilter_keep_reasons",
     "prefilter_drop_reasons",
     "prefilter_review_reasons",
+    "prefilter_keep_count_by_type",
+    "prefilter_drop_count_by_type",
+    "prefilter_review_count_by_type",
 ]
 
 
@@ -102,6 +112,26 @@ def resolve_mention_column(fieldnames: list[str], requested: str) -> str:
             f"{', '.join(DEFAULT_MENTION_CANDIDATES)}"
         )
     return found
+
+
+def count_by_type(mentions: list[str], types: list[str], sep: str = " ; ") -> str:
+    """
+    Count mentions by type and return formatted string like "COMPANY:5 ; PRODUCT:2 ; SERVICE:1".
+    """
+    from collections import Counter
+    
+    type_counter: Counter[str] = Counter()
+    for m_type in types:
+        if m_type.strip():
+            type_counter[m_type.strip()] += 1
+    
+    if not type_counter:
+        return ""
+    
+    # Sort by type name for consistent output
+    sorted_counts = sorted(type_counter.items())
+    result = sep.join(f"{t}:{c}" for t, c in sorted_counts)
+    return result
 
 
 def main() -> int:
@@ -153,6 +183,7 @@ def main() -> int:
         fieldnames = list(reader.fieldnames or [])
         mention_col = resolve_mention_column(fieldnames, args.mentions_column)
         count_col = pick_existing(fieldnames, DEFAULT_COUNT_CANDIDATES)
+        mention_type_col = pick_existing(fieldnames, DEFAULT_MENTION_TYPE_CANDIDATES)
         has_source = args.source_column in fieldnames
 
         # Convert reader to list to support tqdm
@@ -169,26 +200,41 @@ def main() -> int:
         iterator = tqdm(rows_in, desc="Prefiltering mentions") if tqdm else rows_in
         for row in iterator:
             raw_mentions = split_mentions(row.get(mention_col, "") or "", args.sep)
+            raw_mention_types = []
+            if mention_type_col:
+                raw_mention_types = split_mentions(row.get(mention_type_col, "") or "", args.sep)
+            # Ensure types list is same length as mentions (pad with "COMPANY" if needed)
+            while len(raw_mention_types) < len(raw_mentions):
+                raw_mention_types.append("COMPANY")
+            # Trim if types exceed mentions (shouldn't happen)
+            raw_mention_types = raw_mention_types[:len(raw_mentions)]
+            
             source_company = (row.get(args.source_column) or "").strip() if has_source else ""
 
             keep_mentions: list[str] = []
+            keep_mention_types: list[str] = []
             drop_mentions: list[str] = []
+            drop_mention_types: list[str] = []
             review_mentions: list[str] = []
+            review_mention_types: list[str] = []
 
             keep_reasons: list[str] = []
             drop_reasons: list[str] = []
             review_reasons: list[str] = []
 
-            for mention in raw_mentions:
+            for mention, mention_type in zip(raw_mentions, raw_mention_types):
                 label, reason = label_mention(mention, source_company=source_company)
                 if label == "keep":
                     keep_mentions.append(mention)
+                    keep_mention_types.append(mention_type)
                     keep_reasons.append(reason)
                 elif label == "drop_obvious_junk":
                     drop_mentions.append(mention)
+                    drop_mention_types.append(mention_type)
                     drop_reasons.append(reason)
                 else:
                     review_mentions.append(mention)
+                    review_mention_types.append(mention_type)
                     review_reasons.append(reason)
 
             # Preserve explicit union count if available and valid; else compute from mention list.
@@ -202,7 +248,9 @@ def main() -> int:
             out = dict(row)
             out["org_mentions_union_count"] = str(union_count_val)
             out["org_mentions_union"] = join_mentions(raw_mentions, args.sep)
+            out["mention_types_union"] = join_mentions(raw_mention_types, args.sep)
             out["org_mentions_union_filtered"] = join_mentions(keep_mentions, args.sep)
+            out["mention_types_union_filtered"] = join_mentions(keep_mention_types, args.sep)
 
             out["prefilter_input_column"] = mention_col
             out["prefilter_total_mentions"] = str(len(raw_mentions))
@@ -215,6 +263,11 @@ def main() -> int:
             out["prefilter_keep_reasons"] = join_mentions(keep_reasons, args.sep)
             out["prefilter_drop_reasons"] = join_mentions(drop_reasons, args.sep)
             out["prefilter_review_reasons"] = join_mentions(review_reasons, args.sep)
+            
+            # Track counts by mention type for transparency in drop calculation
+            out["prefilter_keep_count_by_type"] = count_by_type(keep_mentions, keep_mention_types, args.sep)
+            out["prefilter_drop_count_by_type"] = count_by_type(drop_mentions, drop_mention_types, args.sep)
+            out["prefilter_review_count_by_type"] = count_by_type(review_mentions, review_mention_types, args.sep)
 
             rows_out.append(out)
 

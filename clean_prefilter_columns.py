@@ -12,6 +12,7 @@ KEEP_COLUMNS = [
     "window_id",
     "source_company",
     "source_cik",
+    "submitter_cik",
     "filing_year",
     "section",
     "cue_phrase",
@@ -20,8 +21,10 @@ KEEP_COLUMNS = [
     "window_text",
     "org_mentions_union_count",
     "org_mentions_union",
+    "mention_types_union_filtered",
     "org_mentions_union_filtered",
     "org_mentions_removed_count",
+    "org_mentions_removed_count_by_type",
 ]
 
 INPUT_COLUMN_ALIASES = {
@@ -43,7 +46,47 @@ REMOVE_COLUMNS = {
     "prefilter_keep_reasons",
     "prefilter_drop_reasons",
     "prefilter_review_reasons",
+    "prefilter_keep_count_by_type",
+    "prefilter_drop_count_by_type",
+    "prefilter_review_count_by_type",
 }
+
+
+def parse_type_counts(type_str: str, sep: str = " ; ") -> dict[str, int]:
+    """Parse 'TYPE:count ; TYPE:count' format into {TYPE: count}."""
+    result = {}
+    if not type_str or not type_str.strip():
+        return result
+    for part in type_str.split(sep):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        try:
+            t, c = part.split(":", 1)
+            result[t.strip()] = int(str(c).strip())
+        except (ValueError, AttributeError):
+            continue
+    return result
+
+
+def count_types_from_mentions(mention_types_str: str, sep: str = " ; ") -> dict[str, int]:
+    """Count occurrence of each type in a semicolon-separated list."""
+    result = {}
+    if not mention_types_str or not mention_types_str.strip():
+        return result
+    for t in mention_types_str.split(sep):
+        t = t.strip()
+        if t:
+            result[t] = result.get(t, 0) + 1
+    return result
+
+
+def format_type_counts(type_dict: dict[str, int], sep: str = " ; ") -> str:
+    """Format {TYPE: count} into 'TYPE:count ; TYPE:count' (sorted by type name)."""
+    if not type_dict:
+        return ""
+    sorted_items = sorted(type_dict.items())
+    return sep.join(f"{t}:{c}" for t, c in sorted_items)
 
 
 def clean_csv(input_path: str, output_path: str = None) -> None:
@@ -92,11 +135,28 @@ def clean_csv(input_path: str, output_path: str = None) -> None:
             union_mentions = count_mentions(row.get(input_union_col, ""))
             filtered_mentions = count_mentions(row.get(input_filtered_col, ""))
             mentions_removed = union_mentions - filtered_mentions
+            
+            # Calculate removed counts by type
+            # Parse keep counts by type and calculate total by type from union mention_types
+            keep_by_type = parse_type_counts(row.get("prefilter_keep_count_by_type", ""))
+            mention_types_union = row.get("mention_types_union", "")
+            total_by_type = count_types_from_mentions(mention_types_union)
+            
+            # removed_by_type = total_by_type - keep_by_type
+            removed_by_type = {}
+            for t, total_count in total_by_type.items():
+                keep_count = keep_by_type.get(t, 0)
+                removed_count = total_count - keep_count
+                if removed_count > 0:
+                    removed_by_type[t] = removed_count
+            
+            removed_count_by_type_str = format_type_counts(removed_by_type)
 
             filtered_row = {
                 "window_id": row.get("window_id", ""),
                 "source_company": row.get("source_company", ""),
                 "source_cik": row.get("source_cik", ""),
+                "submitter_cik": row.get("submitter_cik", ""),
                 "filing_year": row.get("filing_year", ""),
                 "section": row.get("section", ""),
                 "cue_phrase": row.get("cue_phrase", ""),
@@ -107,8 +167,10 @@ def clean_csv(input_path: str, output_path: str = None) -> None:
                 if input_union_count_col
                 else str(union_mentions),
                 "org_mentions_union": row.get(input_union_col, ""),
+                "mention_types_union_filtered": row.get("mention_types_union_filtered", ""),
                 "org_mentions_union_filtered": row.get(input_filtered_col, ""),
                 "org_mentions_removed_count": str(mentions_removed),
+                "org_mentions_removed_count_by_type": removed_count_by_type_str,
             }
 
             rows.append(filtered_row)
