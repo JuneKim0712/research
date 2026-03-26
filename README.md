@@ -21,13 +21,14 @@ The work sits at the intersection of **information extraction** and **corporate 
 10. [Company node list](#company-node-list--build_company_nodespy)
 11. [Stage 3: Candidate windows (ABCD)](#stage-3-candidate-windows-abcd)
 12. [Stage 4: Explicit windows](#stage-4-explicit-windows)
-13. [Stage 5: Organization mentions (NER)](#stage-5-organization-mentions-ner) — `abcdef_auto.py`, `abcdef_ft.py`, `abcdef_v2.py`, flat span script
-14. [Mention quality: prefilter and dropset](#mention-quality-prefilter-and-dropset)
-15. [Competition extraction: low-information term filter](#competition-extraction-low-information-term-filter)
-16. [Dependencies](#dependencies)
-17. [Challenges faced throughout the project](#challenges-faced-throughout-the-project)
-18. [Open challenges and limitations](#open-challenges-and-limitations)
-19. [Reference: folders, routing, audits, thresholds](#reference-folders-routing-audits-thresholds)
+13. [Stage 5: Organization mentions (NER)](#stage-5-organization-mentions-ner) — `abcdef_auto.py`, `abcdef_ft.py`, flat span script
+14. [Model evaluation](#model-evaluation)
+15. [Mention quality: prefilter and dropset](#mention-quality-prefilter-and-dropset)
+16. [Competition extraction: low-information term filter](#competition-extraction-low-information-term-filter)
+17. [Dependencies](#dependencies)
+18. [Challenges faced throughout the project](#challenges-faced-throughout-the-project)
+19. [Open challenges and limitations](#open-challenges-and-limitations)
+20. [Reference: folders, routing, audits, thresholds](#reference-folders-routing-audits-thresholds)
 
 ---
 
@@ -51,8 +52,8 @@ The work sits at the intersection of **information extraction** and **corporate 
 | **Contextual explicit** | Cues that often co-occur with rivals but are **less list-like** than strict (e.g. “highly competitive”). |
 | **Explicit windows** | Rows kept after filtering to **strict + contextual explicit** only → `explicit_candidate_windows.csv` for NER. |
 | **`window_id`** | Stable ID for one **explicit** window (e.g. `EXPW…`), used to tie mentions back to text. |
-| **NER** | **Named entity recognition** — token-level span tagging. **`abcdef_auto.py`** (pretrained) / **`abcdef_ft.py`** (your checkpoint) / **`abcdef_v2.py`** use **Hugging Face** token classification only (**`Jean-Baptiste/roberta-large-ner-english`** by default). **`extract_explicit_mentions_raw.py`** is a separate **per-span** exporter that still bundles **spaCy + HF** in code (see its docstring if you use it). |
-| **ORG / LOC / PRODUCT** | CoNLL-style labels the RoBERTa NER can emit. **`abcdef_auto.py`** default **`--hf-keep-labels`** keeps **`ORG,LOC`** (CoNLL-style; see script) and **does not** keep **`PER`** or **`MISC`**. **`abcdef_v2.py`** default keeps **`ORG`** only. |
+| **NER** | **Named entity recognition** — token-level span tagging. **`abcdef_auto.py`** (pretrained) and **`abcdef_ft.py`** (your checkpoint) use **Hugging Face** token classification only (**`Jean-Baptiste/roberta-large-ner-english`** by default for auto). **`extract_explicit_mentions_raw.py`** is a separate **per-span** exporter that still bundles **spaCy + HF** in code (see its docstring if you use it). |
+| **ORG / LOC / PRODUCT** | CoNLL-style labels the RoBERTa NER can emit. **`abcdef_auto.py`** default **`--hf-keep-labels`** keeps **`ORG,LOC,PRODUCT`** (see script); **`PER`** and **`MISC`** are **not** kept unless you override. Use **`--hf-keep-labels ORG`** on **`abcdef_auto.py`** / **`abcdef_ft.py`** for an ORG-only harvest. |
 | **Mention** | A **text span** tagged as a company-like string (not yet a resolved **entity**). |
 | **Entity linking** | Mapping a **string** (e.g. “Alphabet Inc.”) to a canonical ID (usually **CIK**). **Out of scope** in-repo; needed for clean graph nodes/edges on the **target** side. |
 | **Union mentions** | **Merged** mention list from both extractors (`org_mentions_union`, etc.) before or after prefilter columns. |
@@ -81,7 +82,7 @@ The work sits at the intersection of **information extraction** and **corporate 
 - Mass **ingestion and cleaning** of 10-K primary documents.
 - **Conservative section slicing** with explicit min/max lengths and isolation buckets for failures.
 - **Cue-based windowing** with tiers (strict / contextual / broad) and overlap deduplication—optimized for recall of explicit competitor language while separating noise.
-- **HF token NER** (`abcdef_auto.py` / `abcdef_v2.py`) with offset mapping from normalized text back to the original NER input column for traceability.
+- **HF token NER** (`abcdef_auto.py` / `abcdef_ft.py`) with offset mapping from normalized text back to the original NER input column for traceability.
 
 **What is explicitly out of scope (so far)**
 
@@ -152,7 +153,7 @@ Run stages **in this order**. Optional steps are marked *(optional)*.
 | **4** *(optional)* | `build_company_nodes.py` | `{year}_company_nodes.csv` — one row per CIK (ticker, industry); **not** required for windowing. |
 | **5** | `abcd.py` (or `build_candidate_windows.py`) | `candidate_windows_*.csv`, `window_audit_summary.txt`, JSONL under `{year}_abcd/`. |
 | **6** | `abcde.py` or `build_explicit_candidate_windows.py` | **`explicit_candidate_windows.csv`** — strict + contextual explicit rows, **`window_id`**. |
-| **7** | `abcdef_auto.py` (default), **`abcdef_ft.py`** (fine-tuned checkpoint), or **`abcdef_v2.py`** (ORG-only) | Window-level **raw** / **nonraw** / **org_diff** CSVs (`*_explicit_mentions_raw*.csv`). |
+| **7** | `abcdef_auto.py` (default) or **`abcdef_ft.py`** (fine-tuned checkpoint); use **`--hf-keep-labels ORG`** for ORG-only spans | Window-level **raw** / **nonraw** / **org_diff** CSVs (`*_explicit_mentions_raw*.csv`). |
 | **8** *(optional)* | **`abcdef_com.py`** | Runs auto + FT and merges **raw** span columns (**Auto first**, then FT, ` ; ` joins). Use **`--merge-only`** with existing `--auto-csv` / `--ft-csv`. Docstring may reference `colab_abcdef_auto_ft.py`; the repo entry point is **`abcdef_com.py`**. |
 | **9** | `build_union_prefilter_output.py` | Applies **`org_mention_prefilter`** → `org_mentions_union_filtered` + `prefilter_*` audit columns. Input is usually **nonraw** (`*_nonraw.csv`). |
 | **10** | `clean_prefilter_columns.py` | Compact **`*_cleaned.csv`** without verbose `prefilter_*` fields. |
@@ -193,7 +194,7 @@ flowchart LR
   MON -.->|retrain, fix data, new labels| VER
 ```
 
-**Map to this repository.** SEC inputs and derived CSVs ≈ **sources**; scripts from cleaning through HF NER (`abcdef_auto.py` / `abcdef_v2.py`), prefilter, and optional **`llm.py`** / **`gemini_mention_label.py`** ≈ **feature pipeline**; future graph construction and GNN / link-prediction runs ≈ **experiments**; use **time-aware splits** and **leakage checks** under **evaluation**; pin environments, seeds, and artifact versions for **reproducibility** (registry and CI/CD are optional layers on top).
+**Map to this repository.** SEC inputs and derived CSVs ≈ **sources**; scripts from cleaning through HF NER (`abcdef_auto.py` / `abcdef_ft.py`), prefilter, and optional **`llm.py`** / **`gemini_mention_label.py`** ≈ **feature pipeline**; future graph construction and GNN / link-prediction runs ≈ **experiments**; use **time-aware splits** and **leakage checks** under **evaluation**; pin environments, seeds, and artifact versions for **reproducibility** (registry and CI/CD are optional layers on top).
 
 ---
 
@@ -230,7 +231,6 @@ flowchart LR
 | **`abcdef_auto.py`** | **Window-level** mention harvest: **HF RoBERTa-large NER only**; raw / nonraw / org-diff CSVs; exported **`mention_types_*`** as **COMPANY** / **TICKER** / **REGION**; **`mention_ner_backend_*`** (default **`roberta`**). See [Stage 5](#stage-5-organization-mentions-ner). |
 | **`abcdef_ft.py`** | Same CSV shape as **`abcdef_auto.py`**; requires **`--hf-ner-model`** (fine-tuned checkpoint); default extractor tag **`roberta_ner_ft`**. |
 | **`abcdef_com.py`** | Runs **`abcdef_auto.py`** + **`abcdef_ft.py`**, then merges **raw** window CSVs (**Auto spans first**, then FT, ` ; ` in bundled columns). **`--merge-only`** merges existing `--auto-csv` and `--ft-csv`. |
-| **`abcdef_v2.py`** | Same outputs as **`abcdef_auto.py`** but **ORG-only** spans (`--hf-keep-labels` default **`ORG`**) and uniform org-style typing. |
 | **`extract_explicit_mentions_raw.py`** | **One row per mention span** (no window aggregation / org-diff). Still **spaCy + HF** in implementation—differs from **`abcdef_auto.py`**. |
 | **`run_org_detection_years.py`** | Multi-step runner for one or more years (manifest → ABCD → explicit → **`abcdef_auto.py`** → prefilter + clean); see [End-to-end process order](#end-to-end-process-order). |
 | **`competition_low_info_filter.py`** | **`is_low_information_term(term)`** — conservative filter for vague *market / industry / sector / …* phrases without real modifiers; see [§ Competition extraction](#competition-extraction-low-information-term-filter). |
@@ -341,16 +341,9 @@ Same outputs and CSV shape as **`abcdef_auto.py`**, but **`--hf-ner-model`** is 
 
 ```bash
 python abcdef_ft.py -i explicit_candidate_windows.csv -o ORG_ft_raw.csv --hf-ner-model ./your-ner-checkpoint
+# ORG-only spans:
+python abcdef_auto.py -i explicit_candidate_windows.csv -o ORG_only_raw.csv --hf-keep-labels ORG
 ```
-
-### `abcdef_v2.py` (ORG-only variant)
-
-Same CLI shape and **same window-level CSV columns** as **`abcdef_auto.py`**, but:
-
-- Default **`--hf-keep-labels`** is **`ORG`** only.
-- Every span is typed as organization-style output (**COMPANY** in exported `mention_types*`).
-
-Use when you want a **strict ORG harvest** without LOC/PRODUCT spans.
 
 ### `extract_explicit_mentions_raw.py` (mention-per-row — **legacy dual extractor**)
 
@@ -486,6 +479,98 @@ So the expected outcome is **iterative**: tune prompts/thresholds, accept residu
 
 ---
 
+## Model evaluation
+
+This section summarizes **quantitative evaluation** of the **fine-tuned RoBERTa token classifier** used in **`abcdef_ft.py`** (competition-domain **`INDUSTRY`** and **`PRODUCT`** spans). Metrics are reported on a held-out **validation** split and a separate **test** split. **Token-level** scores reflect BIO tag decisions over the full sequence; **entity-level** scores follow **SemEval-style** matching rules (see terminology below).
+
+#### Terminology
+
+| Term | Meaning |
+|------|---------|
+| **BIO tagging** | Begin–Inside–Outside encoding: each token receives a label indicating whether it starts an entity (**B-**), continues one (**I-**), or is outside any entity (**O**). |
+| **`O` token** | A token labeled as not part of a named entity. In disclosure text, **most tokens are `O`**, which inflates **accuracy** relative to **precision**, **recall**, and **F1**. |
+| **Token-level metrics** | Computed per token over BIO labels (e.g., precision/recall/F1 for the non-`O` classes in the standard multi-class formulation). |
+| **Entity-level (SemEval-style)** | Metrics aggregated over **predicted vs gold entity spans** (start/end indices and type), using standard **strict / exact / partial / type** criteria. |
+| **Strict match** | Predicted span must match the gold span **exactly** (same boundaries **and** correct entity type). This is the **most conservative** entity-level criterion. |
+| **Exact match** | Same boundaries as gold; type rules follow the reported scenario definition (here aligned with strict-type comparisons in the summary table). |
+| **Partial match** | Boundaries overlap sufficiently that the span is counted as partially correct (overlap-based; see contest-specific rules). |
+| **Type match** | Correct **type** assignment; boundary requirements are relaxed relative to strict matching. |
+| **Correct / incorrect / partial / missed / spurious** | Entity-level counts: true positives by scenario, boundary or type errors, false negatives (missed gold entities), and false positives (spurious predictions). |
+
+### Token-Level Performance: Validation vs Test Split
+
+At the token level, **precision**, **recall**, and **F1** are the primary indicators of tagging quality. **Accuracy** is reported for completeness but is **less informative** than precision/recall/F1 because BIO sequences are dominated by **`O`** tokens, which can yield high accuracy even when entity spans are imperfect. The **F1** gap between validation and test is **0.0075**—small enough to suggest **stable generalization**; precision and recall move only slightly between splits.
+
+| Metric | Validation | Test | Difference (Test - Val) |
+|--------|---:|---:|---:|
+| Loss | 0.2381 | 0.2313 | -0.0068 |
+| Precision | 0.6584 | 0.6624 | 0.0040 |
+| Recall | 0.6965 | 0.7079 | 0.0114 |
+| F1-Score | 0.6769 | 0.6844 | 0.0075 |
+| Accuracy | 0.9274 | 0.9260 | -0.0013 |
+| Runtime (sec) | 1.44 | 1.37 | - |
+| Samples / sec | 387.0 | 407.6 | - |
+| Steps / sec | 48.5 | 50.9 | - |
+
+### SemEval-Style Entity-Level Evaluation
+
+Entity-level results use **SemEval-style** span matching. **Strict** evaluation is the **most conservative** score: it requires **exact boundaries and the correct type**. **Partial** and **type** scenarios are more forgiving; on the **test** split, **partial** F1 (**0.7500**) exceeds **strict** F1 (**0.6700**), which indicates that the model often localizes approximately correct entities while **boundary** alignment remains imperfect—i.e., **boundary mismatches** rather than wholesale **missed** entities. Validation and test **strict** F1 (**0.6800** vs **0.6700**) remain close, consistent with **stable generalization** at the entity level as well.
+
+**Overall SemEval-style comparison (validation vs test)**
+
+| Scenario | Val Precision | Val Recall | Val F1 | Test Precision | Test Recall | Test F1 | Δ F1 (Test-Val) |
+|----------|---:|---:|---:|---:|---:|---:|---:|
+| Strict | 0.6600 | 0.6900 | 0.6800 | 0.6400 | 0.7000 | 0.6700 | -0.0100 |
+| Exact | 0.6600 | 0.7000 | 0.6800 | 0.6400 | 0.7000 | 0.6700 | -0.0100 |
+| Partial | 0.7400 | 0.7700 | 0.7500 | 0.7200 | 0.7800 | 0.7500 | 0.0000 |
+| Type | 0.7800 | 0.8200 | 0.8000 | 0.7700 | 0.8400 | 0.8000 | 0.0000 |
+
+**Validation overall entity-level results**
+
+| Scenario | Correct | Incorrect | Partial | Missed | Spurious | Precision | Recall | F1 |
+|----------|---:|---:|---:|---:|---:|---:|---:|---:|
+| Type | 754 | 22 | 0 | 140 | 185 | 0.7800 | 0.8200 | 0.8000 |
+| Exact | 638 | 138 | 0 | 140 | 185 | 0.6600 | 0.7000 | 0.6800 |
+| Partial | 638 | 0 | 138 | 140 | 185 | 0.7400 | 0.7700 | 0.7500 |
+| Strict | 635 | 141 | 0 | 140 | 185 | 0.6600 | 0.6900 | 0.6800 |
+
+**Test overall entity-level results**
+
+| Scenario | Correct | Incorrect | Partial | Missed | Spurious | Precision | Recall | F1 |
+|----------|---:|---:|---:|---:|---:|---:|---:|---:|
+| Type | 791 | 19 | 0 | 135 | 211 | 0.7700 | 0.8400 | 0.8000 |
+| Exact | 658 | 152 | 0 | 135 | 211 | 0.6400 | 0.7000 | 0.6700 |
+| Partial | 658 | 0 | 152 | 135 | 211 | 0.7200 | 0.7800 | 0.7500 |
+| Strict | 657 | 153 | 0 | 135 | 211 | 0.6400 | 0.7000 | 0.6700 |
+
+### Per-Entity Strict Results
+
+Under **strict** matching, performance is broken down by gold **entity type**. On the **test** split, **`INDUSTRY`** attains the **higher** strict F1 (**0.7000**); **`PRODUCT`** is **weaker** (**0.6500**), reflecting noisier boundaries or confusability for product-like spans. The same ordering holds on **validation** (**0.6900** vs **0.6700**).
+
+**Validation per entity type (strict)**
+
+| Entity | Correct | Incorrect | Partial | Missed | Spurious | Precision | Recall | F1 |
+|--------|---:|---:|---:|---:|---:|---:|---:|---:|
+| INDUSTRY | 225 | 39 | 0 | 40 | 88 | 0.6400 | 0.7400 | 0.6900 |
+| PRODUCT | 410 | 83 | 0 | 119 | 116 | 0.6700 | 0.6700 | 0.6700 |
+
+**Test per entity type (strict)**
+
+| Entity | Correct | Incorrect | Partial | Missed | Spurious | Precision | Recall | F1 |
+|--------|---:|---:|---:|---:|---:|---:|---:|---:|
+| INDUSTRY | 233 | 43 | 0 | 38 | 77 | 0.6600 | 0.7400 | 0.7000 |
+| PRODUCT | 424 | 93 | 0 | 114 | 151 | 0.6300 | 0.6700 | 0.6500 |
+
+#### Interpretation
+
+Together, token-level and entity-level tables describe a model that **generalizes steadily** from validation to test: **F1** moves by **0.0075** at the token level, and **strict** entity F1 remains in a narrow band (**0.6800 → 0.6700** in the summary table). **Precision** and **recall** are **stable** across splits at the token level. Because **accuracy** is dominated by **`O`** tokens, it should not be read as the primary quality indicator. **Strict** entity scores are the **most conservative** headline for end-to-end span extraction; **partial** and **type** results indicate that many errors are **boundary-level** rather than complete misses. **`INDUSTRY`** is the **stronger** strict type on test; **`PRODUCT`** is the **weaker**, suggesting that product mentions merit extra scrutiny in downstream filtering or labeling.
+
+#### Takeaway
+
+Reported metrics support **moderate, stable** NER performance on competition-domain entities, with **no large validation–test gap**. For research claims and graph construction, **entity-level strict F1** and **type-specific strict** breakdowns are more informative than token **accuracy** alone; **`PRODUCT`** spans in particular may require additional post-processing or review compared with **`INDUSTRY`**.
+
+---
+
 ## Mention quality: prefilter and dropset
 
 NER tags **strings**, not resolved entities: legal suffixes, geography, punctuation-only spans, payers, and filing boilerplate often appear as `ORG`. The junk layer sits **after** span extraction and **before** alias resolution or edge construction so downstream steps do not treat obvious noise as company names.
@@ -559,7 +644,7 @@ python competition_low_info_filter.py   # runs built-in keep/remove demo asserti
 
 - **10-K processing:** `beautifulsoup4`, `lxml`, `tqdm` (see scripts’ imports).
 - **ABCD:** standard library + optional **`tqdm`**.
-- **NER (`abcdef_auto.py` / `abcdef_v2.py`):** `requirements-explicit-mentions.txt` — **`transformers`**, **`torch`** only (no spaCy). Use **Python 3.10–3.12** for smoothest `torch`/`transformers` wheels unless you manage builds yourself.
+- **NER (`abcdef_auto.py` / `abcdef_ft.py`):** `requirements-explicit-mentions.txt` — **`transformers`**, **`torch`** only (no spaCy). Use **Python 3.10–3.12** for smoothest `torch`/`transformers` wheels unless you manage builds yourself.
 - **Legacy flat span script:** `extract_explicit_mentions_raw.py` still imports **spaCy** if you run it; install **`spacy`** and a model separately for that path.
 - **Gemini mention labeling (optional):** `google-generativeai`; set **`GEMINI_API_KEY`** (see [§ Gemini mention labeling](#gemini-mention-labeling)); prefer **`llm.py`** as the CLI.
 - **Company node CSV (optional):** `requirements-company-nodes.txt` — `certifi`, `yfinance` for [`build_company_nodes.py`](#company-node-list--build_company_nodespy).
@@ -1070,3 +1155,4 @@ For each file in the cleaned folder that has **both** a business section and a c
 ---
 
 *README generated for the research workspace; align `PATH` / year constants in entry-point scripts with your local SEC data layout before batch runs.*
+
