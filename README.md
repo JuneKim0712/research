@@ -12,21 +12,22 @@ The work sits at the intersection of **information extraction** and **corporate 
    - [Temporal motivation: 2023 vs 2024](#temporal-motivation-2023-vs-2024)
 2. [Glossary](#glossary)
 3. [High-level pipeline](#high-level-pipeline)
-4. [MLOps overview (reference diagram)](#mlops-overview-reference-diagram)
-5. [Why these design choices](#why-these-design-choices)
-6. [Script and module index](#script-and-module-index)
-7. [Stage 1: Cleaning, section extraction, and routing](#stage-1-cleaning-section-extraction-and-routing)
-8. [Stage 2: Manifest](#stage-2-manifest)
-9. [Company node list](#company-node-list--build_company_nodespy)
-10. [Stage 3: Candidate windows (ABCD)](#stage-3-candidate-windows-abcd)
-11. [Stage 4: Explicit windows](#stage-4-explicit-windows)
-12. [Stage 5: Organization mentions (NER)](#stage-5-organization-mentions-ner)
-13. [Mention quality: prefilter and dropset](#mention-quality-prefilter-and-dropset)
-14. [Dependencies](#dependencies)
-15. [Challenges faced throughout the project](#challenges-faced-throughout-the-project)
-16. [Open challenges and limitations](#open-challenges-and-limitations)
-17. [Work on when have time](#work-on-when-have-time)
-18. [Reference: folders, routing, audits, thresholds](#reference-folders-routing-audits-thresholds)
+4. [End-to-end process order](#end-to-end-process-order)
+5. [MLOps overview (reference diagram)](#mlops-overview-reference-diagram)
+6. [Why these design choices](#why-these-design-choices)
+7. [Script and module index](#script-and-module-index)
+8. [Stage 1: Cleaning, section extraction, and routing](#stage-1-cleaning-section-extraction-and-routing)
+9. [Stage 2: Manifest](#stage-2-manifest)
+10. [Company node list](#company-node-list--build_company_nodespy)
+11. [Stage 3: Candidate windows (ABCD)](#stage-3-candidate-windows-abcd)
+12. [Stage 4: Explicit windows](#stage-4-explicit-windows)
+13. [Stage 5: Organization mentions (NER)](#stage-5-organization-mentions-ner) — `abcdef_auto.py`, `abcdef_ft.py`, `abcdef_v2.py`, flat span script
+14. [Mention quality: prefilter and dropset](#mention-quality-prefilter-and-dropset)
+15. [Competition extraction: low-information term filter](#competition-extraction-low-information-term-filter)
+16. [Dependencies](#dependencies)
+17. [Challenges faced throughout the project](#challenges-faced-throughout-the-project)
+18. [Open challenges and limitations](#open-challenges-and-limitations)
+19. [Reference: folders, routing, audits, thresholds](#reference-folders-routing-audits-thresholds)
 
 ---
 
@@ -42,7 +43,7 @@ The work sits at the intersection of **information extraction** and **corporate 
 | **Item 1 (Business)** | Standard 10-K section describing the business; primary source for **business** / **competition** text extracts here. |
 | **XBRL** | **eXtensible Business Reporting Language** — structured tagging often embedded in SEC HTML; treated as noise for **plain-text** extraction in this project. |
 | **Manifest** | Per-year **inventory** of extracted `*_business.txt` files (paths, CIK, dates, sizes) built by `build_manifest.py`; join key for later stages. |
-| **Company node list** | Optional filer/node export (`build_company_nodes.py`): one row per parsed `*_business.txt` file with company name, CIK, ticker, and GICS-style sector (via Yahoo/yfinance)—for graph or modeling prep, not windowing. |
+| **Company node list** | Optional **deduplicated filer table** (`build_company_nodes.py`): one row per CIK with company name, ticker, NAICS-style industry (via SEC SIC + crosswalk), and GICS-style sector (via Yahoo/yfinance)—for graph or modeling prep, not windowing. |
 | **ABCD** | **Candidate-window stage**: cue-based **sentence windows** around competitive language (`abcd.py` / related scripts), before the explicit-only filter. |
 | **Candidate window** | A **short span of sentences** around a matched **cue phrase**, exported for audit or NER. |
 | **Cue phrase / cue group** | The **matched pattern** (and its **tier**: strict, contextual, implicit, etc.) that triggered a window. |
@@ -50,8 +51,8 @@ The work sits at the intersection of **information extraction** and **corporate 
 | **Contextual explicit** | Cues that often co-occur with rivals but are **less list-like** than strict (e.g. “highly competitive”). |
 | **Explicit windows** | Rows kept after filtering to **strict + contextual explicit** only → `explicit_candidate_windows.csv` for NER. |
 | **`window_id`** | Stable ID for one **explicit** window (e.g. `EXPW…`), used to tie mentions back to text. |
-| **NER** | **Named entity recognition** — models that tag spans (e.g. `ORG`) in text; here **spaCy** + a **Hugging Face** token-classification model, merged for recall. |
-| **ORG / MISC** | NER **labels**: **organization** vs **miscellaneous** (HF’s `MISC` often catches company-like phrases not tagged `ORG`). |
+| **NER** | **Named entity recognition** — token-level span tagging. **`abcdef_auto.py`** (pretrained) / **`abcdef_ft.py`** (your checkpoint) / **`abcdef_v2.py`** use **Hugging Face** token classification only (**`Jean-Baptiste/roberta-large-ner-english`** by default). **`extract_explicit_mentions_raw.py`** is a separate **per-span** exporter that still bundles **spaCy + HF** in code (see its docstring if you use it). |
+| **ORG / LOC / PRODUCT** | CoNLL-style labels the RoBERTa NER can emit. **`abcdef_auto.py`** default **`--hf-keep-labels`** keeps **`ORG,LOC`** (CoNLL-style; see script) and **does not** keep **`PER`** or **`MISC`**. **`abcdef_v2.py`** default keeps **`ORG`** only. |
 | **Mention** | A **text span** tagged as a company-like string (not yet a resolved **entity**). |
 | **Entity linking** | Mapping a **string** (e.g. “Alphabet Inc.”) to a canonical ID (usually **CIK**). **Out of scope** in-repo; needed for clean graph nodes/edges on the **target** side. |
 | **Union mentions** | **Merged** mention list from both extractors (`org_mentions_union`, etc.) before or after prefilter columns. |
@@ -80,7 +81,7 @@ The work sits at the intersection of **information extraction** and **corporate 
 - Mass **ingestion and cleaning** of 10-K primary documents.
 - **Conservative section slicing** with explicit min/max lengths and isolation buckets for failures.
 - **Cue-based windowing** with tiers (strict / contextual / broad) and overlap deduplication—optimized for recall of explicit competitor language while separating noise.
-- **Dual NER** (spaCy + Hugging Face) with offset mapping back to original window text for traceability.
+- **HF token NER** (`abcdef_auto.py` / `abcdef_v2.py`) with offset mapping from normalized text back to the original NER input column for traceability.
 
 **What is explicitly out of scope (so far)**
 
@@ -126,10 +127,10 @@ flowchart LR
     ABCD[candidate windows]
     Exp[explicit_candidate_windows]
   end
-  subgraph ner [NER]
-    ORG[ORG mentions CSVs]
+  subgraph ner [NER and cleanup]
+    ORG[HF NER mentions CSVs]
     Flt[prefilter / dropset]
-    LLM[Gemini mention label optional]
+    LLM[Gemini / llm.py optional]
   end
   Raw --> Clean --> Biz
   Clean --> Iso
@@ -137,19 +138,30 @@ flowchart LR
   Flt -.-> LLM
 ```
 
-**Typical flow**
+**Typical flow (short)** — ingest → manifest → ABCD → explicit windows → NER → junk prefilter → optional Gemini. See **[End-to-end process order](#end-to-end-process-order)** for the full numbered sequence and orchestration scripts.
 
-1. Run the main processor (`a.py` / `script.py` / `restore_2023_outputs.py`—see [index](#script-and-module-index)) to populate `*_10K_cleaned/`, `*_10K_business/`, and audit/isolation folders.
-2. Optionally **`append_competition_to_business.py`** when both business and competition blocks exist in the cleaned file, so competition prose is available in the same file used for windowing.
-3. **`build_manifest.py`** — inventory of extracted `*_business.txt` files.
-4. **`abcd.py`** (or `build_candidate_windows.py`) — cue-based **`candidate_windows.*`** + **`window_audit_summary.txt`**.
-5. **`build_explicit_candidate_windows.py`** / **`abcde.py`** — strict + contextual rows only, stable schema, **`explicit_candidate_windows.csv`**.
-6. **`abcdef.py`** — spaCy + HF NER → window-level raw/nonraw + optional org-diff log. **`extract_explicit_mentions_raw.py`** is a slimmer variant (mention-per-row only).
-7. **`build_union_prefilter_output.py`** — apply the `org_mention_prefilter` policy to mention-list rows and write **`ORG_detection/union_filtered_prefilter_output.csv`** (includes `org_mentions_union_filtered` + `prefilter_*` audit columns).
-8. **`clean_prefilter_columns.py`** — strip verbose prefilter audit fields and write **`ORG_detection/union_filtered_prefilter_output_cleaned.csv`**.
-9. Optionally **`gemini_mention_label.py`** — after junk filtering, batch **Gemini** classification of each surviving mention (`mention_org` + `source_company` + `source_sentence`) into company / product brand / generic category / agency / other, with a deterministic **`pipeline_role`** for downstream routing. Requires **`GEMINI_API_KEY`** and `pip install google-generativeai`.
+### End-to-end process order
 
-If you want steps 7+8 in one command, use **`run_prefilter_pipeline.py`**.
+Run stages **in this order**. Optional steps are marked *(optional)*.
+
+| Step | Script(s) | Output / role |
+|------|-----------|----------------|
+| **1** | `a.py`, `script.py`, or `restore_2023_outputs.py` | `{year}_10K_cleaned/`, `{year}_10K_business/`, `{year}_no_outgoing_edges/`, `{year}_10K_isolated/`, audits |
+| **2** *(optional)* | `append_competition_to_business.py` | Appends competition text into business extracts when both sections exist (single file for manifest + ABCD). |
+| **3** | `build_manifest.py` | `manifest.csv` / JSON — inventory of `*_business.txt` paths and filing metadata. |
+| **4** *(optional)* | `build_company_nodes.py` | `{year}_company_nodes.csv` — one row per CIK (ticker, industry); **not** required for windowing. |
+| **5** | `abcd.py` (or `build_candidate_windows.py`) | `candidate_windows_*.csv`, `window_audit_summary.txt`, JSONL under `{year}_abcd/`. |
+| **6** | `abcde.py` or `build_explicit_candidate_windows.py` | **`explicit_candidate_windows.csv`** — strict + contextual explicit rows, **`window_id`**. |
+| **7** | `abcdef_auto.py` (default), **`abcdef_ft.py`** (fine-tuned checkpoint), or **`abcdef_v2.py`** (ORG-only) | Window-level **raw** / **nonraw** / **org_diff** CSVs (`*_explicit_mentions_raw*.csv`). |
+| **8** *(optional)* | **`abcdef_com.py`** | Runs auto + FT and merges **raw** span columns (**Auto first**, then FT, ` ; ` joins). Use **`--merge-only`** with existing `--auto-csv` / `--ft-csv`. Docstring may reference `colab_abcdef_auto_ft.py`; the repo entry point is **`abcdef_com.py`**. |
+| **9** | `build_union_prefilter_output.py` | Applies **`org_mention_prefilter`** → `org_mentions_union_filtered` + `prefilter_*` audit columns. Input is usually **nonraw** (`*_nonraw.csv`). |
+| **10** | `clean_prefilter_columns.py` | Compact **`*_cleaned.csv`** without verbose `prefilter_*` fields. |
+| **—** | **`run_prefilter_pipeline.py`** | One command for **steps 9–10** if you already have a nonraw mention CSV. |
+| **—** | **`run_org_detection_years.py`** | One command for **steps 3, 5–10** per year: manifest → ABCD → **`abcde.py`** → **`abcdef_auto.py`** → prefilter → clean; copies into **`ORG_detection/`** with `{year}_` prefixes (7 sub-steps internally). Does **not** replace step **1** (ingest). |
+| **11** *(optional)* | `llm.py` or `gemini_mention_label.py` | Gemini mention typing after junk filtering (`llm_*`, **`pipeline_role`**). |
+| **12** *(optional)* | **`competition_low_info_filter.py`** | **`is_low_information_term()`** — drop vague standalone “market / sector / …” **without** substantive modifiers; use when trimming competition-domain phrases (does **not** replace org junk prefilter). |
+
+**Orchestrator mapping (`run_org_detection_years.py`).** For each year: **(1)** manifest → **(2)** `abcd.py` → **(3)** `abcde.py` → **(4)** `abcdef_auto.py` → **(5)** `build_union_prefilter_output.py` (input: nonraw) → **(6)** `clean_prefilter_columns.py` → **(7)** flatten/copy CSVs into `ORG_detection/`.
 
 ### MLOps overview (reference diagram)
 
@@ -181,7 +193,7 @@ flowchart LR
   MON -.->|retrain, fix data, new labels| VER
 ```
 
-**Map to this repository.** SEC inputs and derived CSVs ≈ **sources**; scripts from cleaning through NER, prefilter, and optional **`gemini_mention_label.py`** ≈ **feature pipeline**; future graph construction and GNN / link-prediction runs ≈ **experiments**; use **time-aware splits** and **leakage checks** under **evaluation**; pin environments, seeds, and artifact versions for **reproducibility** (registry and CI/CD are optional layers on top).
+**Map to this repository.** SEC inputs and derived CSVs ≈ **sources**; scripts from cleaning through HF NER (`abcdef_auto.py` / `abcdef_v2.py`), prefilter, and optional **`llm.py`** / **`gemini_mention_label.py`** ≈ **feature pipeline**; future graph construction and GNN / link-prediction runs ≈ **experiments**; use **time-aware splits** and **leakage checks** under **evaluation**; pin environments, seeds, and artifact versions for **reproducibility** (registry and CI/CD are optional layers on top).
 
 ---
 
@@ -194,8 +206,11 @@ flowchart LR
 | **Four cue groups + demotion** | Not every “competitive” sentence names a rival. **Demotion** patterns reduce catalog/regulation/boilerplate hits. **Strict** cues target list-like competitor sentences. |
 | **Overlap dedup (bigram Jaccard-style)** | Adjacent sentences can trigger duplicate windows; dedup saves annotation/NER cost. **`analyze_dedup.py`** exists to verify we do not merge distinct evidence. |
 | **Heading fallback (in `abcd.py`)** | If a competition heading exists but no cue fired, you still get a **low-priority** window so human or downstream review can recover recall. |
-| **Dual NER + span merge** | Single models miss spans or mis-tag; **union** improves recall. Offsets map through **normalized text** so spans align to **original** `window_text`. |
-| **`org_mention_junk_dropset` + `prefilter`** | NER emits **legal suffixes, geographies, fragments**. A **sample-informed** dropset (RoBERTa `org_detection_mentions_2000_*`, plus `ORG_Strict_Raw_600*`) supports automatic junk removal before alias/edge work—transparently versioned. |
+| **HF token NER + span merge** | Default **`Jean-Baptiste/roberta-large-ner-english`**; kept labels are configurable (`--hf-keep-labels`). Offsets map through **normalized text** to the **original NER input column** (`ner_input_text`). |
+| **Drop PER/MISC by default** | CoNLL emits **PER** and **MISC**, but **`abcdef_auto.py`** defaults keep **ORG, LOC, PRODUCT** only—reduces person/miscellaneous noise in a **competitor-name** harvest. Override `--hf-keep-labels` if you need them. |
+| **No zero-shot mention typing in `abcdef_auto.py`** | Mention **type** beyond ticker/LOC/PRODUCT heuristics uses **HF NER on the mention substring** only (no BART-MNLI), for speed and reproducibility. |
+| **`org_mention_prefilter` + dropset** | NER emits **legal suffixes, fragments**, and noisy spans. Versioned **`DROPSPEC_*`** rules in **`org_mention_prefilter.py`** (and snapshot **`org_mention_junk_dropset.py`**) support junk removal before alias/edge work. Nationality / regional **demonyms** (e.g. *European*, *Chinese*) are **kept** as signals; **`abcdefg.py`** mirrors dropset data (keep **`DROPSPEC_VERSION`** in sync if you edit one file). |
+| **`competition_low_info_filter.py`** | Optional **second** filter for **competition-domain** phrasing: drops standalone vague heads (*market*, *sector*, …) when there is no substantive modifier; does **not** remove broad product nouns (*software*, *pharmaceuticals*, …). See [§ Competition extraction: low-information term filter](#competition-extraction-low-information-term-filter). |
 
 ---
 
@@ -208,18 +223,26 @@ flowchart LR
 | **`restore_2023_outputs.py`** | **2023** reprocessing from `SEC/2023_10K_raw` with local `OUTPUT_DIRS`—useful when normalizing folder layout. |
 | **`append_competition_to_business.py`** / **`ab.py`** | When cleaned filings contain **both** business and competition sections, **append** competition text to the paired business extract so cueing sees full context. |
 | **`build_manifest.py`** | Filename + size manifest over `*_10K_business`; no NLP. |
-| **`build_company_nodes.py`** | **Optional:** union of `*_business.txt` under `{year}_10k_business` / `{year}_10K_business` and `{year}_no_outgoing_edges` → **`{year}_company_nodes.csv`** (one row per parsed `*_business.txt`: name, CIK, ticker, GICS sector). See [§ Company node list](#company-node-list--build_company_nodespy). |
+| **`build_company_nodes.py`** | **Optional:** union of `*_business.txt` under `{year}_10k_business` / `{year}_10K_business` and `{year}_no_outgoing_edges` → **`{year}_company_nodes.csv`** (one row per CIK: name, ticker, NAICS industry, GICS sector). See [§ Company node list](#company-node-list--build_company_nodespy). |
 | **`abcd.py`** | **Primary** ABCD step: manifest → **`candidate_windows.csv`**, **`candidate_windows.jsonl`**, **`window_audit_summary.txt`**. Includes heading fallback and tqdm. |
 | **`build_candidate_windows.py`** | Same conceptual step as `abcd.py`; **variant** (e.g. cue/fallback differences—use one consistently per study). |
 | **`build_explicit_candidate_windows.py`** / **`abcde.py`** | Filter to **strict + contextual explicit** rows; dedupe; assign **`window_id`** → **`explicit_candidate_windows.csv`**. |
-| **`abcdef.py`** | **Window-level** ORG harvest: raw columns, **`_nonraw`** dedupe, **`_org_diff`** span analysis. |
-| **`extract_explicit_mentions_raw.py`** | **One row per mention span** (no window aggregation / org-diff). |
+| **`abcdef_auto.py`** | **Window-level** mention harvest: **HF RoBERTa-large NER only**; raw / nonraw / org-diff CSVs; exported **`mention_types_*`** as **COMPANY** / **TICKER** / **REGION**; **`mention_ner_backend_*`** (default **`roberta`**). See [Stage 5](#stage-5-organization-mentions-ner). |
+| **`abcdef_ft.py`** | Same CSV shape as **`abcdef_auto.py`**; requires **`--hf-ner-model`** (fine-tuned checkpoint); default extractor tag **`roberta_ner_ft`**. |
+| **`abcdef_com.py`** | Runs **`abcdef_auto.py`** + **`abcdef_ft.py`**, then merges **raw** window CSVs (**Auto spans first**, then FT, ` ; ` in bundled columns). **`--merge-only`** merges existing `--auto-csv` and `--ft-csv`. |
+| **`abcdef_v2.py`** | Same outputs as **`abcdef_auto.py`** but **ORG-only** spans (`--hf-keep-labels` default **`ORG`**) and uniform org-style typing. |
+| **`extract_explicit_mentions_raw.py`** | **One row per mention span** (no window aggregation / org-diff). Still **spaCy + HF** in implementation—differs from **`abcdef_auto.py`**. |
+| **`run_org_detection_years.py`** | Multi-step runner for one or more years (manifest → ABCD → explicit → **`abcdef_auto.py`** → prefilter + clean); see [End-to-end process order](#end-to-end-process-order). |
+| **`competition_low_info_filter.py`** | **`is_low_information_term(term)`** — conservative filter for vague *market / industry / sector / …* phrases without real modifiers; see [§ Competition extraction](#competition-extraction-low-information-term-filter). |
+| **`llm.py`** | Primary **Gemini** mention-labeling script (batching, resume, `--single-call`, disk cache). |
+| **`format_llm_mention_csv.py`** | Reorder LLM-labeled CSV columns for human review / Excel. |
 | **`build_union_prefilter_output.py`** | Build **`union_filtered_prefilter_output.csv`** from mention-list columns, applying `org_mention_prefilter.label_mention()` and emitting `org_mentions_union_filtered` + `prefilter_*` audit fields. |
 | **`clean_prefilter_columns.py`** | Remove verbose `prefilter_*` processing columns and export compact **`*_cleaned.csv`** files for downstream review/modeling. |
 | **`run_prefilter_pipeline.py`** | One-command wrapper for prefilter build + cleanup. Auto-discovers 2023/2024 `explicit_mentions_raw_nonraw` inputs (or accepts `--input`) and writes both working and cleaned outputs. |
-| **`gemini_mention_label.py`** | Optional **LLM pass** (Google Gemini, free-tier–friendly defaults): classifies junk-filtered mentions into `llm_*` fields and **`pipeline_role`** (`explicit_company_candidate`, `explicit_support_via_product`, `implicit_only`, `ignore_or_review`). Batched JSON I/O, retries, disk cache. Env: **`GEMINI_API_KEY`**. See [§ Gemini mention labeling](#gemini-mention-labeling). |
+| **`gemini_mention_label.py`** | Older / alternate **Gemini** entry point; prefer **`llm.py`** for new runs (more CLI controls). Same env: **`GEMINI_API_KEY`**. See [§ Gemini mention labeling](#gemini-mention-labeling). |
 | **`org_mention_prefilter.py`** | Labels each raw mention string: `keep` / `drop_obvious_junk` / `review` (see [§ Mention quality](#mention-quality-prefilter-and-dropset)). |
-| **`org_mention_junk_dropset.py`** | **Data-only** policy for the prefilter: exact sets, regexes, review list; versioned as `DROPSPEC_VERSION` / `DROPSPEC_EVIDENCE` (examples in [§ Mention quality](#mention-quality-prefilter-and-dropset)). |
+| **`org_mention_junk_dropset.py`** | **Compatibility re-export** of dropset constants from **`org_mention_prefilter.py`**; can emit **`org_mention_junk_dropset.json`**. |
+| **`abcdefg.py`** | Standalone dropset policy module (parallel to prefilter); verify **`DROPSPEC_VERSION`** matches **`org_mention_prefilter.py`** if you edit rules in one place only. |
 | **`count_competition_only.py`** | Heuristic **count** of extracts that look **competition-only** (no business header in snippet). |
 | **`isolate_no_outgoing_edges.py`** | **Moves** files from `2023_10K_business` into `2023_no_outgoing_edges` per audit JSON list. |
 | **`cleanup_recheck.py`**, **`update_json_paths.py`**, **`update_folder_names.py`** | Small **2023 list / path** maintenance scripts for `2023_business_no_competition_term_list.json`. |
@@ -240,7 +263,7 @@ The full routing table and folder semantics are in [Reference](#reference-folder
 
 See **`build_manifest.py`** in the [reference section](#manifest-builder--build_manifestpy) below. The manifest is the join key between **filing identity** (date, accession, company name, CIK from filename) and **on-disk text paths** for ABCD.
 
-For a filer/node export table (rows sourced from parsed `*_business.txt` files with ticker + industry fields for graphs or modeling), see [`build_company_nodes.py`](#company-node-list--build_company_nodespy) in the reference section below.
+For a **deduplicated filer table** (one row per CIK with ticker + industry fields for graphs or modeling), see [`build_company_nodes.py`](#company-node-list--build_company_nodespy) in the reference section below.
 
 ---
 
@@ -272,51 +295,66 @@ Interpretation of the audit file (counts, tiers, fallback) is documented below u
 
 ## Stage 5: Organization mentions (NER)
 
-### `abcdef.py` (full window-level outputs)
+### `abcdef_auto.py` (window-level bundles — **current default path**)
 
-Runs **spaCy** (`en_core_web_sm` by default) and **Hugging Face** token classification (default **`Jean-Baptiste/roberta-large-ner-english`**). Keeps **ORG** (spaCy) and **ORG + MISC** (HF—MISC often catches company-like phrases). Merges identical spans from both models.
+- **Model:** Hugging Face **`Jean-Baptiste/roberta-large-ner-english`** (RoBERTa-**large**, not base).
+- **Backends:** **HF token NER only** (no spaCy). Span tag in `extractor_name` comes from **`--hf-extractor-tag`** (default `roberta_ner`); CSV **`mention_ner_backend_*`** columns show **`roberta`** (or `spacy+roberta` only if you merge legacy data).
+- **Default `--hf-keep-labels`:** **`ORG,LOC,PRODUCT`**. **`PER`** and **`MISC`** are **not** kept unless you override the flag. Standard CoNLL checkpoints **do not** emit **`PRODUCT`**; the label is there for custom / fine-tuned models.
+- **Mention typing:** Ticker regex, **LOC → REGION**, **PRODUCT → ComputingProduct**, and a second **HF NER pass on the mention substring** for org vs product hints. **No** separate zero-shot (BART-MNLI) classifier.
+- **NER text column:** **`--ner-text-column auto`** uses **`org_mentions_union_filtered`** when present, else **`window_text`**. Offsets are into **`ner_input_text`**; **`window_text`** stays the full window for context.
+- **Sentence snippet:** **`sentence_text`** uses a **`.!?` / newline heuristic** on `ner_input_text` (not spaCy sentence boundaries).
 
 Outputs (given `-o my_raw.csv`):
 
-1. **`my_raw.csv`** — one row per **window**; `org_mentions_raw`, offsets, extractors.
-2. **`my_raw_nonraw.csv`** — same windows, **unique** mention strings.
-3. **`my_raw_org_diff.csv`** (or `--org-diff-log`) — span-level diff between raw and deduped views.
+1. **`my_raw.csv`** — one row per **window**; bundled mentions, offsets, types, backends.
+2. **`my_raw_nonraw.csv`** — same windows, **unique** mention strings (case-insensitive dedupe).
+3. **`my_raw_org_diff.csv`** (default path next to `-o`, or **`--org-diff-log`**) — span-level diff between raw sequence and nonraw set.
 
-**`my_raw.csv` (window-level raw mention bundle) columns:**
+**Window-level raw CSV — core columns (schema aligned with union500-style exports):**
 
-- `org_mentions_raw_count` — number of mention spans retained for the window (raw, no text dedupe).
-- `org_mentions_raw` — semicolon-joined mention strings in span order.
-- `mention_starts_raw`, `mention_ends_raw` — semicolon-joined offset lists aligned to `org_mentions_raw`.
-- `extractors_raw` — semicolon-joined extractor tags (e.g., spaCy / HF tag names).
+| Column | Meaning |
+|--------|---------|
+| `window_id`, `source_company`, `source_cik`, `filing_year`, `section`, `cue_phrase`, `cue_group`, `trigger_sentence`, `window_text`, `ner_input_text` | Filing + window identity; **`ner_input_text`** is what NER saw. |
+| `org_mentions_raw_count` | Count of spans in order (no text dedupe). |
+| `org_mentions_raw` | ` ; `-joined mention strings. |
+| `mention_starts_raw`, `mention_ends_raw` | ` ; `-joined offsets into **`ner_input_text`**. |
+| `mention_types_raw` | ` ; `-joined **COMPANY** / **TICKER** / **REGION** (internal `ORGANIZATION  ` / `ComputingProduct` mapped for CSV). |
+| `mention_ner_backend_raw` | ` ; `-joined short backend label (default **`roberta`**). |
 
-**`my_raw_nonraw.csv` (window-level deduped mention bundle) columns:**
+**Nonraw CSV:** adds **`org_mentions_count`**, **`org_mentions`**, **`mention_types`**, **`mention_ner_backend`** (deduped lists, same ` ; ` convention). **`org_mention_count`** is duplicated for older joins.
 
-- `org_mentions_count` — count of unique mention strings per window (case-insensitive dedupe).
-- `org_mentions` — semicolon-joined unique mention strings.
-
-**`my_raw_org_diff.csv` columns:**
-
-- `raw_org_span_count` — total raw spans in window.
-- `nonraw_unique_org_count` — unique mention count after nonraw dedupe.
-- `raw_mention`, `mention_start`, `mention_end`, `extractor_name` — diff row detail.
-- `extra_source`, `diff_reason` — why this row appears in the diff log.
+**Org-diff CSV:** `raw_org_span_count`, `nonraw_unique_org_count`, `raw_mention`, `mention_start`, `mention_end`, `extractor_name`, `extra_source`, `diff_reason`.
 
 ```bash
 pip install -r requirements-explicit-mentions.txt
-python -m spacy download en_core_web_sm
-python abcdef.py -i explicit_candidate_windows.csv -o ORG_out_raw.csv
-# NER only on a precomputed union column (offsets are into that column; full window still in window_text):
-# With org_mentions_union_filtered on the CSV, default --ner-text-column auto already uses it:
-python abcdef.py -i windows_with_union.csv -o ORG_out_raw.csv
-# Force full-window NER:
-python abcdef.py -i windows.csv -o ORG_out_raw.csv --ner-text-column window_text
+python abcdef_auto.py -i explicit_candidate_windows.csv -o ORG_out_raw.csv
+# With org_mentions_union_filtered on the CSV, --ner-text-column auto uses it:
+python abcdef_auto.py -i windows_with_union.csv -o ORG_out_raw.csv
+python abcdef_auto.py -i windows.csv -o ORG_out_raw.csv --ner-text-column window_text
+# Optional: GPU for HF (--device 0), custom labels, custom extractor tag
+python abcdef_auto.py -i in.csv -o out.csv --hf-keep-labels ORG,LOC --device 0
 ```
 
-**Known issue (Python 3.14+):** In this repo's current dependency set, spaCy import can fail on Python 3.14 with a Pydantic v1 compatibility error (for example: `unable to infer type for attribute "REGEX"`). When this happens, `abcdef.py` prints a warning and continues in Hugging Face-only mode. For dual-extractor output (spaCy + HF), run this stage in a Python 3.11 or 3.12 environment.
+### `abcdef_ft.py` (fine-tuned checkpoint only)
 
-### `extract_explicit_mentions_raw.py` (mention-per-row)
+Same outputs and CSV shape as **`abcdef_auto.py`**, but **`--hf-ner-model`** is **required** (local folder or Hub id). Default **`--hf-extractor-tag`** is **`roberta_ner_ft`** → CSV **`mention_ner_backend_*`** shows **`roberta_ft`**.
 
-Same models and normalization, but output is **one row per mention span** (`raw_mention`, `mention_start`, `mention_end`, …). No bundled nonraw/org-diff artifacts—use when you only need a flat mention list. **`--ner-text-column auto`** (default): use **`org_mentions_union_filtered`** when that column exists (NER only sees the prefilter-approved mention list string); otherwise **`window_text`**. Output includes **`ner_input_text`** (the string NER saw); **`window_text`** remains the full window.
+```bash
+python abcdef_ft.py -i explicit_candidate_windows.csv -o ORG_ft_raw.csv --hf-ner-model ./your-ner-checkpoint
+```
+
+### `abcdef_v2.py` (ORG-only variant)
+
+Same CLI shape and **same window-level CSV columns** as **`abcdef_auto.py`**, but:
+
+- Default **`--hf-keep-labels`** is **`ORG`** only.
+- Every span is typed as organization-style output (**COMPANY** in exported `mention_types*`).
+
+Use when you want a **strict ORG harvest** without LOC/PRODUCT spans.
+
+### `extract_explicit_mentions_raw.py` (mention-per-row — **legacy dual extractor**)
+
+**One row per mention span** (`raw_mention`, `mention_start`, `mention_end`, `extractor_name`, `sentence_text`, …). **No** bundled nonraw/org-diff. Implementation still uses **spaCy + HF** and older defaults—prefer **`abcdef_auto.py`** for new work unless you explicitly need this flat schema. **`--ner-text-column auto`** behaves like **`abcdef_auto.py`** when **`org_mentions_union_filtered`** exists.
 
 ### `build_union_prefilter_output.py` (prefilter working file)
 
@@ -409,7 +447,7 @@ python run_prefilter_pipeline.py --input path/to/nonraw.csv --output-dir ORG_det
 
 ### Gemini mention labeling
 
-**Script:** `gemini_mention_label.py`
+**Primary script:** **`llm.py`** (batching, resume, `--single-call`, rate-limit helpers). **Alternate:** `gemini_mention_label.py`.
 
 Use **after** junk filtering (and ideally on a CSV that already has stable columns for the extracted span and its sentence). For each row, the script sends **`mention_org`** (fallback: `raw_mention`), **`source_company`** (fallback: `source_company_name`), and **`source_sentence`** (fallback: `sentence_text`, then `trigger_sentence`) to **Gemini** in batches, requests **strict JSON**, retries on malformed output, and **caches** by hash of `(mention, company, sentence)`.
 
@@ -429,12 +467,14 @@ The prompt favors **conservative** labels (`OTHER` when unclear). Model and batc
 ```bash
 pip install google-generativeai
 export GEMINI_API_KEY=...   # Google AI Studio key
-python gemini_mention_label.py -i mentions_filtered.csv -o mentions_labeled.csv --batch-size 8 --test
+python llm.py -i mentions_filtered.csv -o mentions_labeled.csv --batch-size 8 --test
+# Legacy entry point:
+# python gemini_mention_label.py -i mentions_filtered.csv -o mentions_labeled.csv --batch-size 8 --test
 ```
 
 #### Product vs company: limitations and the ideal label struggle
 
-This pipeline keeps hitting the same wall: **CoNLL-style NER only emits coarse tags** (`ORG`, `MISC`, …), so **product brands, generics, and firms** are tangled before any downstream step. **`gemini_mention_label.py`** is an optional **LLM** layer for typing mentions in **sentence context**; it is still **not** entity linking (no CIK), and labels remain **judgment calls** (e.g. brand vs firm depends on graph design).
+This pipeline keeps hitting the same wall: **CoNLL-style NER only emits coarse tags** (`ORG`, `LOC`, …), so **product brands, generics, and firms** are tangled before any downstream step. **`llm.py`** (or **`gemini_mention_label.py`**) is an optional **LLM** layer for typing mentions in **sentence context**; it is still **not** entity linking (no CIK), and labels remain **judgment calls** (e.g. brand vs firm depends on graph design).
 
 **Union / filtered lists** (e.g. `org_mentions_union_filtered` as `iPhone ; Fitbit ; MetAlert ; GPS SmartSole® ; ADA`) are useful for alignment with the prefilter, but:
 
@@ -452,10 +492,10 @@ NER tags **strings**, not resolved entities: legal suffixes, geography, punctuat
 
 | Piece | Role |
 |--------|------|
-| **`org_mention_junk_dropset.py`** | **Data only** — `WHITELIST_EXACT_CASEFOLD`, `EXACT_DROP_CASEFOLD`, `DROP_REGEX`, `REVIEW_EXACT_CASEFOLD`. No I/O. Tuned on RoBERTa **`org_detection_mentions_2000_*`** plus earlier strict 600-window runs. |
-| **`org_mention_prefilter.py`** | **Policy** — `normalize_mention()` (quotes/apostrophes → ASCII), `merge_dot_com_spans()`, `MentionFilter.label()`, `label_mention(..., source_company=...)`. Dropset rules plus optional self-filer suppression. |
+| **`org_mention_prefilter.py`** | **Policy + versioned dropset data** — `WHITELIST_EXACT_CASEFOLD`, `EXACT_DROP_CASEFOLD`, `DROP_REGEX`, `REVIEW_EXACT_CASEFOLD`, `DROPSPEC_VERSION` / `DROPSPEC_EVIDENCE`. Also `normalize_mention()`, `merge_dot_com_spans()`, `MentionFilter.label()`, `label_mention(..., source_company=...)`. |
+| **`org_mention_junk_dropset.py`** | Re-exports dropset constants from **`org_mention_prefilter.py`** and can write **`org_mention_junk_dropset.json`**. |
 
-**Versioning.** `DROPSPEC_VERSION` bumps when rules change materially; `DROPSPEC_EVIDENCE` names the sample CSVs the policy was grounded in. `org_mention_prefilter.export_dropset_snapshot()` (and `org_mention_junk_dropset.json`) mirror the live sets for diffs.
+**Versioning.** `DROPSPEC_VERSION` / `DROPSPEC_EVIDENCE` live on **`org_mention_prefilter.py`**. `org_mention_prefilter.export_dropset_snapshot()` and **`org_mention_junk_dropset.json`** mirror the live sets for diffs. If you edit **`abcdefg.py`**, keep it in sync or treat it as scratch—**`org_mention_prefilter.py`** is what the prefilter imports at runtime.
 
 **Labels.**
 
@@ -463,7 +503,7 @@ NER tags **strings**, not resolved entities: legal suffixes, geography, punctuat
 - **`drop_obvious_junk`** — high-confidence non-competitor or non-firm noise (legal shells, lone punctuation, agencies, clinical phrases, etc.).
 - **`review`** — short or ambiguous tokens; do not auto-wire as edges unless you promote them (e.g. whitelist).
 
-**Policy (v4 dropset + prefilter).** Smart quotes/apostrophes normalize to ASCII. Single-letter spans drop except **`x`**. Standalone punctuation and pure-numeric strings drop. Stray **TLD** tokens (`com`, `net`, `org`) drop; use **`merge_dot_com_spans`** on `(text, start, end)` lists to rejoin `Bill.`+`com` → `Bill.com`. Generic governance words, agencies, statute `… Act` phrases, biotech/regulatory wording (e.g. inhibitor, patients, FDA approval), SPAC/IPO boilerplate, service phrases (supply chain services, …), regional descriptors, and trial-stage regexes apply as in `org_mention_junk_dropset.py`. **`source_company`** (filer name from the window row) enables **self-name suppression**: the filer is not treated as its own competitor unless you **whitelist** an unusual case.
+**Policy (versioned dropset in `org_mention_prefilter.py`).** Smart quotes/apostrophes normalize to ASCII. Single-letter spans drop except **`x`**. Standalone punctuation and pure-numeric strings drop. Stray **TLD** tokens (`com`, `net`, `org`) drop; use **`merge_dot_com_spans`** on `(text, start, end)` lists to rejoin `Bill.`+`com` → `Bill.com`. Generic governance words, agencies, statute `… Act` phrases, biotech/regulatory wording (e.g. inhibitor, patients, FDA approval), SPAC/IPO boilerplate, service phrases (supply chain services, …), and trial-stage regexes apply per the live sets in **`org_mention_prefilter.py`**. **Nationality / regional demonyms** (*American*, *European*, *Chinese*, …) and **`US`/`us`** are **not** treated as junk by exact-drop (see **`DROPSPEC_VERSION` ≥ 4.2**). **`source_company`** (filer name from the window row) enables **self-name suppression**: the filer is not treated as its own competitor unless you **whitelist** an unusual case.
 
 **Examples** (`label_mention` returns `(label, reason_slug)`):
 
@@ -479,7 +519,7 @@ label_mention("inhibitor")                  # drop_obvious_junk / inhibitor_word
 label_mention("FDA approval")              # drop_obvious_junk / fda_approval_phrase
 label_mention("initial public offering")   # drop_obvious_junk / exact_drop
 label_mention("supply chain services")     # drop_obvious_junk / exact_drop
-label_mention("european")                  # drop_obvious_junk / exact_drop
+label_mention("European")                  # keep / default_keep  # demonym (not junk)
 
 label_mention("Pfizer")                    # keep / default_keep  # rival (no source passed)
 label_mention("Pfizer", source_company="Pfizer Inc.")   # drop / self_source_full_match
@@ -498,13 +538,31 @@ Audit with self-suppression: `python org_mention_prefilter.py windows.csv --sour
 
 ---
 
+## Competition extraction: low-information term filter
+
+**Module:** **`competition_low_info_filter.py`**
+
+Use **`is_low_information_term(term: str) -> bool`** when you want to drop **vague competitive-context boilerplate** (standalone *market*, *the sector*, *industry sector*, …) **without** removing:
+
+- **Qualified** phrases (*cloud infrastructure market*, *semiconductor industry*, …), or  
+- **Broad product / category** nouns (*software*, *medical devices*, *pharmaceuticals*, …).
+
+Normalization matches the rest of the repo (NFKC, casefolded tokens, trimmed punctuation). This layer is **orthogonal** to **`org_mention_prefilter`** (ORG junk on NER strings). Run it on **competition-domain phrases** you extract separately, or post-process mention lists where domain *head nouns* are noisy.
+
+```bash
+python competition_low_info_filter.py   # runs built-in keep/remove demo assertions
+```
+
+---
+
 ## Dependencies
 
 - **10-K processing:** `beautifulsoup4`, `lxml`, `tqdm` (see scripts’ imports).
 - **ABCD:** standard library + optional **`tqdm`**.
-- **NER:** `requirements-explicit-mentions.txt` — `spacy`, `transformers`, `torch`.
-- **Gemini mention labeling (optional):** `google-generativeai`; set **`GEMINI_API_KEY`** (see [§ Gemini mention labeling](#gemini-mention-labeling)).
-- **Company node CSV (optional):** `requirements-build-company-nodes.txt` — `yfinance`, `tqdm` for [`build_company_nodes.py`](#company-node-list--build_company_nodespy).
+- **NER (`abcdef_auto.py` / `abcdef_v2.py`):** `requirements-explicit-mentions.txt` — **`transformers`**, **`torch`** only (no spaCy). Use **Python 3.10–3.12** for smoothest `torch`/`transformers` wheels unless you manage builds yourself.
+- **Legacy flat span script:** `extract_explicit_mentions_raw.py` still imports **spaCy** if you run it; install **`spacy`** and a model separately for that path.
+- **Gemini mention labeling (optional):** `google-generativeai`; set **`GEMINI_API_KEY`** (see [§ Gemini mention labeling](#gemini-mention-labeling)); prefer **`llm.py`** as the CLI.
+- **Company node CSV (optional):** `requirements-company-nodes.txt` — `certifi`, `yfinance` for [`build_company_nodes.py`](#company-node-list--build_company_nodespy).
 
 ---
 
@@ -516,15 +574,9 @@ This section records **practical problems encountered while building** the pipel
 
 **Configuration and portability.** Early scripts (`a.py`, `script.py`) embed **machine-specific paths**; **`restore_2023_outputs.py`** and other tools assume a particular **`SEC/`** layout. Moving between machines or years requires **manual path edits**—a recurring friction point.
 
-**CIK truth-source mismatch (issuer vs submitter).** A major data-quality bug appeared in local SEC trees: many filenames encoded the accession-prefix CIK (submitter/agent CIK, often `0000950170`-style) while the folder CIK under `SEC/{year}_10K_raw/<cik>/` represented the issuer. This produced false equality in downstream outputs (different companies sharing the same CIK). Example observed in node CSVs: Cytta and Guskin initially shared one submitter CIK even though issuer CIKs differ.
-
-**Solution applied locally.** We standardized on **SEC raw issuer folder CIK as the canonical source of truth** and used accession-prefix CIK only as fallback when issuer evidence is unavailable. The fix was implemented as a workspace migration: (1) rename mismatched `SEC/*_10K_raw` txt stems so accession CIK matches issuer folder CIK, (2) propagate those stem renames to mirrored txt copies (`*_10K_cleaned`, `*_10K_business`, etc.), and (3) update CIK columns in affected CSV outputs where source mapping was available. We also patched `build_company_nodes.py` to prefer issuer-CIK lookup from SEC raw tree before accession-prefix fallback, so future regenerations preserve issuer identity.
-
-**Operational caveat.** A small number of rename collisions can occur when two old stems converge to the same corrected stem. Those are left for deterministic manual handling instead of destructive overwrite.
-
 **Cueing and windows.** Cue phrases are **English-centric** and tuned on recurring disclosure phrasing. **Strict** cues miss rare wording; **broad** tiers pull in boilerplate. **Overlap dedup** saves annotation cost but can **merge** distinct evidence in edge cases. **Heading fallback** helps recall but is not a complete fix.
 
-**NER and mention quality.** Off-the-shelf **CoNLL NER** tags **ORG/MISC**, not “company” or “product”; **brands**, **diseases**, **geographies**, and **filing boilerplate** are often tagged as organizations. A **single** model misses spans; **dual NER** + merge adds complexity. The **junk dropset** and **prefilter** are **sample-grounded** and **iterative**—new domains (e.g. biotech vs retail vs SPAC language) surface new failure modes. **Self-filer suppression** and **whitelists** are needed for edge cases.
+**NER and mention quality.** Off-the-shelf **CoNLL NER** tags **ORG/LOC/PER/MISC**, not “competitor” vs “customer.” **`abcdef_auto.py`** trims labels via **`--hf-keep-labels`** (defaults drop **PER/MISC**) but **geographies** (**LOC**) and **odd boundaries** remain a source of noise. A **single** HF model misses some spans vs a human annotator. The **junk dropset** and **prefilter** are **sample-grounded** and **iterative**—new domains (e.g. biotech vs retail vs SPAC language) surface new failure modes. **Self-filer suppression** and **whitelists** are needed for edge cases.
 
 **Unions, filtering, and second-pass NER.** Aligning **`org_mentions_union`** with **`org_mentions_union_filtered`** and prefilter audit columns was a **workflow struggle**: the “filtered” list is the **company-candidate** set, but running NER on **semicolon-joined** text is **not** natural prose, so boundaries and tags can look odd. Choosing **window text** vs **filtered union** for NER is a deliberate tradeoff between **context** and **scope**.
 
@@ -532,7 +584,7 @@ This section records **practical problems encountered while building** the pipel
 
 **Downstream semantics and scope.** **Mention** ≠ **resolved entity** (no **CIK** linking in this repo). **Competition cue** near a name ≠ **validated competitive edge** (customers, suppliers, partners). Those gaps are **known**; filling them is **follow-on work**.
 
-**Scale and exports.** Full-window NER over **many** explicit rows is **slow** on CPU; GPU helps but adds setup friction. Intermediate CSVs grow **wide** (union columns, prefilter audit fields, LLM columns), so **spot-checking** and **column filtering** became necessary for reviewable artifacts.
+**Scale and exports.** Full-window **RoBERTa-large** NER over **many** explicit rows is **slow** on CPU; GPU (`--device 0`) helps. Removing **spaCy** and the **zero-shot** model reduced wall time versus older dual-model runs. Intermediate CSVs grow **wide** (union columns, prefilter audit fields, LLM columns), so **spot-checking** and **column filtering** became necessary for reviewable artifacts.
 
 **Tooling and collaboration.** Keeping **Git** remotes and **credentials** configured for push, and avoiding **accidentally committing** large sampled CSVs or machine-local paths, is part of day-to-day friction—not solved in code, but part of the project reality.
 
@@ -545,7 +597,7 @@ The numbered list below is a **compact checklist** of technical limitations; the
 1. **Section extraction brittleness** — Unusual Item 1 titles, embedded TOCs, or multi-column HTML can mis-bound sections. Isolated buckets capture some failures but are not a complete inventory of “missed competition.”
 2. **Cue recall vs precision** — Patterns are tuned for common phrasing; rare or non-English firm names in competitor lists may appear in sentences **without** hitting strict cues (mitigated partly by contextual/broad tiers and heading fallback in `abcd.py`).
 3. **Dedup edge cases** — Overlap-based dedup can theoretically merge or split evidence in awkward ways; use **`analyze_dedup.py`** and manual spot checks on high-stakes samples.
-4. **NER is not entity linking** — `ORG`/`MISC` spans are **strings**, not resolved CIKs. Subsidiary names, joint ventures, and “doing business as” labels need a **linking** layer not included here.
+4. **NER is not entity linking** — `ORG`/`LOC`/… spans are **strings**, not resolved CIKs. Subsidiary names, joint ventures, and “doing business as” labels need a **linking** layer not included here.
 5. **False positives and junk** — Legal entities, industries, and geographies are often tagged as organizations. The **junk dropset** is **conservative** and **sample-grounded**; it will need **iteration** as domains change (e.g. biotech vs retail language).
 6. **Configuration drift** — `a.py` / `script.py` use **Windows-style absolute paths** in-repo; **`restore_2023_outputs.py`** uses relative `SEC/` layout. Expect to edit paths when moving machines.
 7. **Downstream graph semantics** — Mentioning a company near a competition cue **does not** guarantee a competitive relationship (customers, suppliers, partners). Additional filtering or labeling is required for research-grade edges.
@@ -809,84 +861,14 @@ manifest folders, for example `2023_manifest/` and `2024_manifest/`.
 
 ### Purpose
 
-`build_company_nodes.py` builds a node CSV from the **union** of all `*_business.txt` files under:
+`build_company_nodes.py` builds **one row per issuer (CIK)** from the **union** of all `*_business.txt` files under:
 
 - `{year}_10k_business` or `{year}_10K_business`, and
 - `{year}_no_outgoing_edges`
 
-under `--base-dir` (defaults to the current directory). Filenames use the same convention as the manifest ([§ Expected filename format](#expected-filename-format)).
-
-Current behavior: **no CIK deduplication**. The output keeps one row per parsed
-`*_business.txt` path, so the same CIK can appear in multiple rows when there
-are multiple filings.
+under `--base-dir` (defaults to the current directory). Filenames use the same convention as the manifest ([§ Expected filename format](#expected-filename-format)). If an issuer has several extracts, the row with the **latest** `filing_date` in the filename is kept.
 
 This step is **optional** for the windowing pipeline; it is meant for **graph / features** (nodes keyed by CIK) rather than per-filing manifests.
-
-### Role in this repo
-
-`build_company_nodes.py` is the bridge between filing-level text outputs and
-graph-level modeling inputs:
-
-- It converts many filing text files into an organized node export with
-  `company_name`, `cik`, `ticker`, and `gics_sector`.
-- It includes issuers from both business extracts and `no_outgoing_edges`, so
-  graph node coverage is not limited to filings that produced candidate windows.
-- It is designed for node attributes and coverage checks, while `abcd.py` and
-  downstream scripts remain responsible for window extraction and mention-level
-  evidence.
-
-### Latest run summary (2023)
-
-Run commands used in this workspace:
-
-```bash
-python build_company_nodes.py --year 2023 --base-dir 2023
-```
-
-Observed outputs:
-
-| Year | Output file | Node rows written | Unique CIKs in rows | Ticker filled | GICS filled |
-|------|-------------|------------------:|--------------------:|--------------:|------------:|
-| 2023 | `2023/2023_company_nodes.csv` | 6,352 | 2,319 | 4,993 | 625 |
-
-Notes from the run logs:
-
-- Progress bars are enabled (`tqdm`) for parsing, row building, ticker fill, and sector fill.
-- Tickers are fetched from yfinance search by company name (not SEC ticker map).
-- A portion of rows still have empty or noisy `gics_sector` values because ticker quality is mixed.
-
-### Chronological count change (raw SEC downloads -> final cleaned company nodes)
-
-The counts below track the same pipeline chronologically from raw SEC downloads to final cleaned node rows.
-
-| Stage | 2023 | 2024 | Total | Delta vs previous stage |
-|------|-----:|-----:|------:|------------------------:|
-| Raw SEC downloads (`SEC/{year}_10K_raw/*.txt`) | 7,358 | 6,635 | 13,993 | - |
-| Routed into `10K_business U no_outgoing_edges` | 6,352 | 5,651 | 12,003 | -1,990 |
-| Final cleaned company nodes (after removing trust/fund/NASDAQ categories) | 6,107 | 5,418 | 11,525 | -478 |
-
-Net change from raw SEC downloads to final cleaned nodes:
-
-- **2023:** 7,358 -> 6,107 (**-1,251**)
-- **2024:** 6,635 -> 5,418 (**-1,217**)
-- **Total:** 13,993 -> 11,525 (**-2,468**)
-
-### Sample window (for downstream context)
-
-`build_company_nodes.py` itself does not emit text windows, but this is a
-representative strict-explicit window from the same 2024 pipeline outputs:
-
-- Source file: `2024/2024_abcd_v1/candidate_windows_strict_explicit.csv`
-- `window_id`: `W0047242`
-- `source_company_name`: `1 800 Flowers Com Inc`
-- `source_cik`: `1084869`
-- `filing_date`: `2024-09-06`
-- `cue_group` / `cue_tier`: `strict_explicit` / `4`
-- `future_profile_hint`: `competition_market`
-- `window_text`:
-
-> In the floral industry, there are various providers of floral products, none
-> of which is dominant in the industry. The Company's competitors include: ...
 
 ### Output files
 
@@ -901,28 +883,29 @@ representative strict-explicit window from the same 2024 pipeline outputs:
 |--------|-------------|
 | `company_name` | Middle segment from the filename parse (same logic as `build_manifest.py`) |
 | `cik` | CIK as an integer string (no leading zeros) |
-| `ticker` | Candidate symbol from yfinance company-name search |
-| `gics_sector` | Yahoo Finance **sector** string via **yfinance** when ticker resolution is valid |
+| `ticker` | Uppercase symbol when resolved |
+| `naics_industry` | `NNNNNN — description` when SEC **SIC** can be mapped via the bundled crosswalk (see below) |
+| `gics_sector` | Yahoo Finance **sector** string via **yfinance** (GICS-aligned for typical U.S. listings; not a numeric GICS code) |
 
-### How ticker and GICS are filled (free sources)
+### How NAICS and GICS are filled (free sources)
 
 | Field | Source |
 |-------|--------|
-| **Ticker** | **`yfinance.Search(company_name)`** with lightweight scoring over quote type and name-token overlap. |
-| **GICS sector** | **`yfinance`** → Yahoo **`Ticker(ticker).info["sector"]`**. |
+| **Ticker** | SEC **`company_tickers.json`** (optional download, cached under `{base-dir}/.cache/`), then EDGAR **`data.sec.gov/submissions/CIK##########.json`** → `tickers[0]` if still empty. |
+| **NAICS industry** | Submissions JSON includes **`sic`** and **`sicDescription`**. The repo ships **`data/naics_sic_crosswalk.json`** from [TorchlightSoftware/naics-sic-crosswalk](https://github.com/TorchlightSoftware/naics-sic-crosswalk) (NAICS↔SIC table derived from the official NAICS PDF). The script maps **SIC → NAICS**; if several NAICS rows share a SIC, it prefers the row whose **SIC description** best overlaps **`sicDescription`**. |
+| **GICS sector** | **`yfinance`** → Yahoo **`Ticker(ticker).info["sector"]`**. This is the standard Yahoo sector label (aligned with GICS for many U.S. names), not MSCI’s proprietary code list. |
 
-**Caveats.** Ticker resolution by free-text company-name search can pick wrong symbols (for example foreign listings, warrants, stale symbols, or unrelated instruments). As a result, `gics_sector` quality depends on ticker quality.
+**Caveats.** NAICS here is **crosswalk-based from SIC**, not a separately reported issuer NAICS from XBRL. Use **`--enrichment`** if you need your own authoritative industry table.
 
 ### Dependencies
 
 Install:
 
 ```bash
-pip install -r requirements-build-company-nodes.txt
+pip install -r requirements-company-nodes.txt
 ```
 
 Includes **`certifi`** (recommended for HTTPS to `sec.gov` / Yahoo on some systems) and **`yfinance`**.
-Includes **`yfinance`** and **`tqdm`**.
 
 ### Usage
 
@@ -932,7 +915,7 @@ python build_company_nodes.py --year 2024
 # Layout: {base-dir}/{year}_10k_business and {year}_no_outgoing_edges
 python build_company_nodes.py --year 2024 --base-dir /path/to/extracts
 
-# Optional CIK-keyed overrides (ticker, gics_*)
+# Optional CIK-keyed overrides (ticker, naics_*, gics_*)
 python build_company_nodes.py --year 2024 --enrichment ./my_industry_overrides.csv
 
 python build_company_nodes.py --year 2024 --no-fetch-tickers
@@ -947,31 +930,13 @@ python build_company_nodes.py --year 2024 --recursive
 | Flag | Meaning |
 |------|---------|
 | `--output` / `-o` | Output CSV path |
-| `--fetch-tickers` / `--no-fetch-tickers` | Resolve ticker from yfinance search (default: on) |
-| `--fetch-classifications` / `--no-fetch-classifications` | Fill GICS sector from yfinance by ticker (default: on) |
-| `--yfinance-sleep` | Seconds to sleep between yfinance requests |
-
-### Quality note (important)
-
-Ticker and GICS quality is currently mixed in the generated 2023 output because
-name-based yfinance search can return non-primary exchanges, stale symbols,
-warrants/rights, or unrelated instruments for some entities. Treat ticker/GICS
-as a draft enrichment field unless validated.
+| `--fetch-tickers` / `--no-fetch-tickers` | Download/cache SEC `company_tickers.json` (default: on) |
+| `--tickers-cache` | Override path for `company_tickers.json` |
+| `--fetch-classifications` / `--no-fetch-classifications` | Submissions + SIC→NAICS + yfinance sector (default: on) |
+| `--submissions-cache` | Directory for per-CIK submissions JSON (default: `{base-dir}/.cache/sec_submissions`) |
+| `--sec-request-sleep` | Seconds to sleep after each **network** submissions fetch (default **0.11**) |
 
 ---
-
-## Work on when have time
-
-- Improve ticker resolver quality:
-  - prefer primary U.S. listings where applicable
-  - down-rank warrant/right/fund/OTC symbols unless explicitly intended
-  - add stricter matching using CIK/name aliases where available
-- Add a confidence score and `ticker_source`/`ticker_quality` columns so weak
-  matches are easy to filter.
-- Build a small manual override map for high-impact mislabels observed in
-  `2023/2023_company_nodes.csv`.
-- Re-run 2024 after the improved resolver and compare ticker/GICS stability
-  against 2023.
 
 ## ABCD Candidate Windows — `abcd.py`
 
@@ -991,63 +956,6 @@ and one audit report:
 - `window_audit_summary.txt`
 
 The script uses a tqdm progress bar during file scanning.
-
-### How the three ABCD bucket files are created
-
-ABCD first detects cue phrases sentence-by-sentence, then computes a short window around each trigger, deduplicates overlapping windows, and finally routes each window into one of three export buckets.
-
-Routing rule:
-
-- `strict_explicit` cue group -> `candidate_windows_strict_explicit.*`
-- `contextual_explicit` cue group -> `candidate_windows_contextual_explicit.*`
-- all other cue groups (`implicit_or_broad`, `heading_fallback_broad`) -> `candidate_windows_broad_or_implicit.*`
-
-Core implementation points in `abcd.py`:
-
-- Cue groups and pattern lists: `STRICT_EXPLICIT_PATTERNS`, `CONTEXTUAL_EXPLICIT_PATTERNS`, `IMPLICIT_OR_BROAD_PATTERNS`
-- Matching order and cue extraction (`cue_text` from regex match): `find_cue(...)`
-- Window expansion by cue type/heading context: `compute_window(...)`
-- Overlap-aware dedup: `deduplicate_windows(...)`
-- Bucket mapping: `export_bucket_for_cue_group(...)`
-- Per-bucket file writing: `_write_bucket_files(...)`
-
-### Cue phrases observed in each 2024 bucket output
-
-From the current 2024 run outputs in `2024/2024_abcd_v1/`, the most frequent `cue_text` values were:
-
-#### `candidate_windows_strict_explicit.csv`
-
-- We compete with
-- competitors include
-- face competition from
-- compete against
-- We face competition from
-- primary competitors
-- significant competitors
-- principal competitors
-
-#### `candidate_windows_contextual_explicit.csv`
-
-- compete
-- competitors
-- our competitors
-- highly competitive
-- market share
-- Competition from
-- competitor
-- Competition in the
-
-#### `candidate_windows_broad_or_implicit.csv`
-
-- competitive advantage
-- distribution channel
-- competitive position
-- distribution network
-- barriers to entry
-- Competition
-- installed base
-
-Related aggregate counts for the same run are also captured in `window_audit_summary.txt` (`By cue_group`, `Top 20 cue phrases`).
 
 ### How to read `window_audit_summary.txt`
 
